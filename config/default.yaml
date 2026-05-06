@@ -1,0 +1,11 @@
+/**:
+  ros__parameters:
+    device: /dev/ttyUSB0
+    baudrate: 115200
+    frame_main: gnss_main
+    frame_aux: gnss_aux
+    heading:
+      length: 111     # cm
+      tolerance: 2    # cm
+      offset: 0       # deg
+      pitch_offset: 0 # deg
