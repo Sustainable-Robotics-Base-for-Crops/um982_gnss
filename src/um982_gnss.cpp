@@ -557,11 +557,6 @@ bool UM982Gnss::command(const std::string& cmd)
 
 void UM982Gnss::callback(const std::vector<uint8_t>& data)
 {
-  if (!initialized_)
-  {
-    return;
-  }
-
   for (uint8_t d : data)
   {
     parse_ascii(d);
