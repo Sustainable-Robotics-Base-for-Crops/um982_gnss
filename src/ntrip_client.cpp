@@ -184,13 +184,13 @@ void NtripClient::init_thread_callback()
     if (authenticate_)
     {
       std::string auth = base64_encode(username_ + ":" + password_);
-      request = "GET /" + mountpoint_ + " HTTP/1.0\r\n" + "User-Agent: NTRIP ntrip_client_ros\r\n" +
-                "Authorization: Basic " + auth + "\r\n" + "Connection: close\r\n\r\n";
+      request = "GET /" + mountpoint_ + " HTTP/1.0\r\n" + "User-Agent: NTRIP ROS2Client\r\n" + "Authorization: Basic " +
+                auth + "\r\n" + "Connection: close\r\n\r\n";
     }
     else
     {
-      request = "GET /" + mountpoint_ + " HTTP/1.0\r\n" + "User-Agent: NTRIP ntrip_client_ros\r\n" +
-                "Connection: close\r\n\r\n";
+      request =
+          "GET /" + mountpoint_ + " HTTP/1.0\r\n" + "User-Agent: NTRIP ROS2Client\r\n" + "Connection: close\r\n\r\n";
     }
 
     if (!tcp_.send(request))
