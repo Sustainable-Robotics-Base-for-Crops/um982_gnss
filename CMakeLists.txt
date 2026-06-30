@@ -45,7 +45,7 @@ target_link_libraries(um982_gnss
   serial)
 ament_target_dependencies(um982_gnss
   ${dependencies})
-rclcpp_components_register_nodes(um982_gnss
+rclcpp_components_register_node(um982_gnss
   PLUGIN "${PROJECT_NAME}::UM982Gnss"
   EXECUTABLE um982_gnss_node)
 
@@ -55,7 +55,7 @@ target_link_libraries(ntrip_client
   tcp)
 ament_target_dependencies(ntrip_client
   ${dependencies})
-rclcpp_components_register_nodes(ntrip_client
+rclcpp_components_register_node(ntrip_client
   PLUGIN "${PROJECT_NAME}::NtripClient"
   EXECUTABLE ntrip_client_node)
 
