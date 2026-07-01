@@ -29,15 +29,9 @@ include_directories(include)
 
 add_library(tcp SHARED
   src/tcp.cpp)
-target_include_directories(tcp PUBLIC
-  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-  "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>")
 
 add_library(serial SHARED
   src/serial.cpp)
-target_include_directories(serial PUBLIC
-  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
-  "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>")
 
 add_library(um982_gnss SHARED
   src/um982_gnss.cpp)
@@ -67,10 +61,6 @@ install(TARGETS
   ARCHIVE DESTINATION lib
   LIBRARY DESTINATION lib
   RUNTIME DESTINATION bin)
-
-install(
-  DIRECTORY include/
-  DESTINATION include/${PROJECT_NAME})
 
 install(DIRECTORY
   config
