@@ -1,0 +1,19 @@
+name: ROS 2 CI Action
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    container:
+      image: rostooling/setup-ros-docker:ubuntu-noble-latest
+    steps:
+      - name: Build and run tests
+        uses: ros-tooling/action-ros-ci@v0.4
+        with:
+          package-name: um982_gnss
+          target-ros2-distro: jazzy
