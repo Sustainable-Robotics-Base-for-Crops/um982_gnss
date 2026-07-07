@@ -1,70 +1,74 @@
 # um982_gnss
 
-ROS 2 package for Unicore UM982 GNSS receivers in dual-antenna rover configuration: serial I/O (binary BESTNAV / STADOP, UNIHEADING, NMEA GGA), publishing fixes and speed/heading, and an optional NTRIP client for RTK corrections (RTCM).
+ROS 2 package for Unicore UM982 dual-antenna GNSS receivers. It provides two lifecycle nodes: `um982_gnss` (serial driver) and `ntrip_client` (RTK corrections).
 
----
+## um982_gnss
 
-## Node `um982_gnss`
+Lifecycle node that opens the serial port, configures the receiver, parses BESTNAV, STADOP, UNIHEADING and NMEA GGA, and publishes fixes for both antennas.
 
-On startup, the driver opens the serial port, sends a sequence of Unicore commands (rover mode, baseline length for heading, message output rates), then parses the stream and fills ROS messages.
+### Overview
 
-### Parameters
+On activate:
 
-| Parameter              | Type   | Default        | Description                                                           |
-| ---------------------- | ------ | -------------- | --------------------------------------------------------------------- |
-| `device`               | string | `/dev/ttyUSB0` | Serial device for the receiver                                        |
-| `baudrate`             | int    | `115200`       | Serial baud rate                                                      |
-| `frame_main`           | string | `gnss_main`    | `frame_id` for the main antenna (published messages)                  |
-| `frame_aux`            | string | `gnss_aux`     | `frame_id` for the auxiliary antenna                                  |
-| `heading.length`       | int    | `100`          | Baseline length for heading, in **cm** (`CONFIG HEADING LENGTH`)      |
-| `heading.tolerance`    | int    | `3`            | Matching tolerance, in **cm**                                         |
-| `heading.offset`       | int    | `0`            | Heading / pitch offset (deg), 1st argument to `CONFIG HEADING OFFSET` |
-| `heading.pitch_offset` | int    | `0`            | 2nd pitch argument for `CONFIG HEADING OFFSET`                        |
+1. Open the serial device and send Unicore configuration (rover mode, heading baseline, message rates).
+2. Parse the incoming stream in a background thread.
+3. Publish `navsatfix/*` and `gpsfix/*` for main and auxiliary antennas.
+4. Publish GNGGA sentences on `nmea` for NTRIP.
+5. Forward incoming `rtcm` messages to the serial port.
 
-### Publishers
+A 2 min timer re-runs configuration if RTK fix is not maintained on both antenna chains (`rtk_fix_ == 3`).
 
-| Topic            | Type                      | Description                                                                 |
-| ---------------- | ------------------------- | --------------------------------------------------------------------------- |
-| `navsatfix/main` | sensor_msgs/msg/NavSatFix | Main antenna position fix (WGS84, covariance, status)                       |
-| `navsatfix/aux`  | sensor_msgs/msg/NavSatFix | Auxiliary antenna position fix                                              |
-| `gpsfix/main`    | gps_msgs/msg/GPSFix       | Extended main fix: speed, heading (`track`), pitch, DOP, errors, etc.       |
-| `gpsfix/aux`     | gps_msgs/msg/GPSFix       | Same for the auxiliary antenna                                              |
-| `nmea`           | nmea_msgs/msg/Sentence    | GNGGA NMEA sentence, `header.frame_id` = `frame_main` — NTRIP / diagnostics |
+### Node parameters
 
-### Subscribers
+| Parameter              | Default (header) | Description                                           |
+| ---------------------- | ---------------- | ----------------------------------------------------- |
+| `device`               | `/dev/ttyUSB0`   | Serial device                                         |
+| `baudrate`             | `115200`         | Serial baud rate                                      |
+| `frame_main`           | `gnss_main`      | `frame_id` for main antenna messages                  |
+| `frame_aux`            | `gnss_aux`       | `frame_id` for auxiliary antenna messages             |
+| `heading.length`       | `100`            | Baseline length for heading (cm)                      |
+| `heading.tolerance`    | `3`              | Baseline matching tolerance (cm)                      |
+| `heading.offset`       | `0`              | Heading offset (deg), 1st `CONFIG HEADING OFFSET` arg |
+| `heading.pitch_offset` | `0`              | Pitch offset (deg), 2nd `CONFIG HEADING OFFSET` arg   |
 
-| Topic  | Type                 | Description                                                            |
-| ------ | -------------------- | ---------------------------------------------------------------------- |
-| `rtcm` | mavros_msgs/msg/RTCM | Received RTCM3 (e.g. from `ntrip_client`) forwarded to the serial port |
+### Topics
 
-An internal timer resets configuration if RTK fix is not maintained on both expected chains (see `rtk_fix_` logic).
+| Topic            | Type                        | Direction | Description                                 |
+| ---------------- | --------------------------- | --------- | ------------------------------------------- |
+| `rtcm`           | `mavros_msgs/msg/RTCM`      | In        | RTCM3 corrections (e.g. from NTRIP)         |
+| `navsatfix/main` | `sensor_msgs/msg/NavSatFix` | Out       | Main antenna WGS84 fix                      |
+| `navsatfix/aux`  | `sensor_msgs/msg/NavSatFix` | Out       | Auxiliary antenna WGS84 fix                 |
+| `gpsfix/main`    | `gps_msgs/msg/GPSFix`       | Out       | Main fix with speed, track, pitch, DOP      |
+| `gpsfix/aux`     | `gps_msgs/msg/GPSFix`       | Out       | Auxiliary fix with speed, track, pitch, DOP |
+| `nmea`           | `nmea_msgs/msg/Sentence`    | Out       | GNGGA sentence (`frame_id` = `frame_main`)  |
 
----
+## ntrip_client
 
-## Node `ntrip_client`
+Lifecycle node that connects to an NTRIP caster, receives RTCM for the selected mountpoint, and republishes it on ROS. It forwards rover GGA from `nmea` to the caster.
 
-TCP connection to the caster, RTCM subscription for the chosen mountpoint, republication on ROS. GGA sentences on `nmea` are typically used to report rover position to the caster.
+### Overview
 
-### Parameters
+On activate:
 
-| Parameter      | Type   | Default     | Description                  |
-| -------------- | ------ | ----------- | ---------------------------- |
-| `host`         | string | `127.0.0.1` | NTRIP caster host            |
-| `port`         | int    | `2101`      | Port (often 2101 for NTRIP)  |
-| `authenticate` | bool   | `false`     | HTTP Basic authentication    |
-| `mountpoint`   | string | `""`        | RTCM stream mountpoint       |
-| `username`     | string | `""`        | Username when `authenticate` |
-| `password`     | string | `""`        | Password when `authenticate` |
-| `frame_id`     | string | `odom`      | `frame_id` on published RTCM |
+1. Open a TCP connection to the NTRIP caster.
+2. Subscribe to `nmea` and send GGA sentences to the caster.
+3. Parse incoming RTCM3 and publish on `rtcm`.
 
-### Publishers
+### Node parameters
 
-| Topic  | Type                 | Description               |
-| ------ | -------------------- | ------------------------- |
-| `rtcm` | mavros_msgs/msg/RTCM | RTCM3 packets to receiver |
+| Parameter      | Default (header) | Description                  |
+| -------------- | ---------------- | ---------------------------- |
+| `host`         | `127.0.0.1`      | NTRIP caster host            |
+| `port`         | `2101`           | NTRIP caster port            |
+| `authenticate` | `false`          | HTTP Basic authentication    |
+| `mountpoint`   | `""`             | RTCM stream mountpoint       |
+| `username`     | `""`             | Username when `authenticate` |
+| `password`     | `""`             | Password when `authenticate` |
+| `frame_id`     | `odom`           | `frame_id` on published RTCM |
 
-### Subscribers
+### Topics
 
-| Topic  | Type                   | Description                             |
-| ------ | ---------------------- | --------------------------------------- |
-| `nmea` | nmea_msgs/msg/Sentence | GGA (and compatible stream) from driver |
+| Topic  | Type                     | Direction | Description                   |
+| ------ | ------------------------ | --------- | ----------------------------- |
+| `nmea` | `nmea_msgs/msg/Sentence` | In        | GGA from `um982_gnss`         |
+| `rtcm` | `mavros_msgs/msg/RTCM`   | Out       | RTCM3 packets to the receiver |
