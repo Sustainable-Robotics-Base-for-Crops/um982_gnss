@@ -1,0 +1,21 @@
+# Colcon / ament build artifacts
+build/
+install/
+log/
+
+# Compiled objects
+*.o
+*.so
+*.a
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+
+# Editors
+*~
+*.swp
