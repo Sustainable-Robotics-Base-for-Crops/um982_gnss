@@ -16,7 +16,7 @@ On activate:
 4. Publish GNGGA sentences on `nmea` for NTRIP.
 5. Forward incoming `rtcm` messages to the serial port.
 
-A 2 min timer re-runs configuration if RTK fix is not maintained on both antenna chains (`rtk_fix_ == 3`).
+**Stuck-receiver watchdog:** if the **main** antenna stays without an RTK/GBAS fix for **2 continuous minutes**, configuration is re-run (`RESET` + setup). The countdown **starts when main loses fix** and is **cancelled** as soon as main recovers. A late auxiliary fix alone does **not** trigger a RESET (dual-fix remains relevant for heading quality, not for this watchdog). This replaces the previous periodic “every 2 min, if not dual-fix then RESET” check, which could reset the receiver during a short outage or while it was already recovering.
 
 ### Node parameters
 

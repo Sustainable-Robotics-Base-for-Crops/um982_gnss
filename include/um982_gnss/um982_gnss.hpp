@@ -3,6 +3,8 @@
 #ifndef UM982_GNSS__UM982_GNSS_HPP_
 #define UM982_GNSS__UM982_GNSS_HPP_
 
+#include <chrono>
+
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "um982_gnss/bestnav.hpp"
@@ -88,8 +90,17 @@ private:
   std::thread init_thread_;
   std::atomic<bool> initialized_;
   std::atomic<bool> stop_thread_;
+  // Bit 0 = main antenna GBAS/RTK fix, bit 1 = auxiliary. Heading quality uses both;
+  // the stuck-receiver watchdog only keys off the main antenna (see timer_callback).
   std::atomic<uint8_t> rtk_fix_{ 0 };
   std::unique_ptr<bond::Bond> bond_;
+
+  // Watchdog: countdown starts when the main antenna loses RTK fix, not on a blind
+  // periodic snapshot. Cleared as soon as main recovers. See timer_callback().
+  bool main_fix_lost_{ false };
+  std::chrono::steady_clock::time_point main_fix_lost_since_{};
+  static constexpr std::chrono::minutes kMainFixLostTimeout{ 2 };
+  static constexpr std::chrono::seconds kWatchdogPollPeriod{ 1 };
 
   rclcpp::TimerBase::SharedPtr timer_;
 
