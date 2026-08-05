@@ -31,6 +31,18 @@ A 2 min timer re-runs configuration if RTK fix is not maintained on both antenna
 | `heading.offset`       | `0`              | Heading offset (deg), 1st `CONFIG HEADING OFFSET` arg |
 | `heading.pitch_offset` | `0`              | Pitch offset (deg), 2nd `CONFIG HEADING OFFSET` arg   |
 
+Instrumentation parameters (see [Diagnosing heading dropouts](#diagnosing-heading-dropouts)):
+
+| Parameter                          | Default | Description                                                            |
+| ---------------------------------- | ------- | ---------------------------------------------------------------------- |
+| `extra_logs`                       | `[]`    | Extra Unicore logs requested after configuration; a refusal only warns |
+| `diagnostics.enable`               | `true`  | Publish `heading_diagnostics`                                          |
+| `diagnostics.rate`                 | `10.0`  | Diagnostics rate (Hz), capped by the 20 Hz `BESTNAVH` rate             |
+| `diagnostics.heading_std_warn`     | `2.0`   | Heading std dev (deg) above which the status is `WARN`                 |
+| `raw_dump.enable`                  | `false` | Dump the raw receiver stream to a file for offline decoding            |
+| `raw_dump.directory`               | `""`    | Destination directory, created if missing                              |
+| `raw_dump.max_mb`                  | `256`   | Dump size cap; the dump stops (the driver does not) when reached       |
+
 ### Topics
 
 | Topic            | Type                        | Direction | Description                                 |
@@ -41,6 +53,43 @@ A 2 min timer re-runs configuration if RTK fix is not maintained on both antenna
 | `gpsfix/main`    | `gps_msgs/msg/GPSFix`       | Out       | Main fix with speed, track, pitch, DOP      |
 | `gpsfix/aux`     | `gps_msgs/msg/GPSFix`       | Out       | Auxiliary fix with speed, track, pitch, DOP |
 | `nmea`           | `nmea_msgs/msg/Sentence`    | Out       | GNGGA sentence (`frame_id` = `frame_main`)  |
+| `heading_diagnostics` | `diagnostic_msgs/msg/DiagnosticArray` | Out | Heading / auxiliary antenna health, see below |
+
+### Diagnosing heading dropouts
+
+On a dual-antenna receiver the auxiliary solution is not a second independent GNSS: it is
+the constrained solution of the baseline between both antennas (`CONFIG HEADING FIXLENGTH`
++ `CONFIG HEADING LENGTH`). It therefore fails for reasons the main antenna never sees —
+differential multipath from the machine itself, antenna coupling, mount flex — and it fails
+under motion rather than under a poor sky. Downstream, `gnss_to_odom` requires **both**
+antennas at RTK fix, so every auxiliary dropout stops the odometry even though the absolute
+position is still centimetre-accurate.
+
+Field measurements that motivated this instrumentation (SRBC, 44 cm baseline, 20 min run):
+main antenna fixed 100 % of the time, auxiliary fix lost 6 times (19 s total) over 24
+tracking dips, each one producing an odometry gap of exactly the same length.
+
+`heading_diagnostics` publishes what is needed to tell the failure modes apart:
+
+| Key                                            | Reading                                                        |
+| ---------------------------------------------- | -------------------------------------------------------------- |
+| `heading.sat_tracked` vs `heading.sat_used`    | tracked high + used low = ambiguity resolution fails, **not** a radio-frequency problem. Both collapsing = antenna or cabling |
+| `aux.sat_tracked` vs `main.sat_tracked`        | asymmetry between the two antenna chains                       |
+| `heading.baseline_m`, `baseline_min/max_m`     | a baseline that moves points at mount flex or vibration; a stable one clears the mechanics |
+| `heading.std_dev_deg`                          | quality of the receiver heading, the figure to gate on instead of a binary fix flag |
+| `heading.pos_type`, `aux.pos_type`             | raw Unicore solution types (`NARROW_INT` = fixed, `NARROW_FLOAT` = float) |
+| `aux.fix_loss_count`, `aux.fix_lost_s`         | cumulative cost of the phenomenon since activation             |
+| `main.diff_age_s`, `aux.diff_age_s`            | rules corrections in or out                                    |
+
+For per-satellite carrier-to-noise ratios, request the observation logs and decode them
+offline from the raw dump:
+
+```yaml
+extra_logs: ["OBSVMB 1", "OBSVHB 1"]
+raw_dump:
+  enable: true
+  directory: /home/srbc/expe/raw_gnss
+```
 
 ## ntrip_client
 

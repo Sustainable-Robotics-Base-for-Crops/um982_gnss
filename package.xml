@@ -19,6 +19,7 @@
   <depend>mavros_msgs</depend>
   <depend>nmea_msgs</depend>
   <depend>gps_msgs</depend>
+  <depend>diagnostic_msgs</depend>
 
   <exec_depend>nav2_lifecycle_manager</exec_depend>
 
