@@ -4,19 +4,26 @@
 
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <unistd.h>
 #include <string.h>
 
-void TCP::close()
+void TCP::interrupt()
 {
   stop_thread_ = true;
 
   if (sockfd_ >= 0)
   {
-    // Interrupt the blocking receive without relying on a system-time polling timeout.
+    // Wake a blocking connect/receive operation without joining its thread.
     ::shutdown(sockfd_, SHUT_RDWR);
   }
+}
+
+void TCP::close()
+{
+  interrupt();
 
   if (thread_.joinable())
   {
@@ -32,7 +39,8 @@ void TCP::close()
   sockfd_ = -1;
 }
 
-bool TCP::open(int port, const std::string& host, const std::function<void(const std::vector<uint8_t>&)>& callback)
+bool TCP::open(int port, const std::string& host, double timeout_seconds,
+               const std::function<void(const std::vector<uint8_t>&)>& callback)
 {
   close();
 
@@ -54,7 +62,46 @@ bool TCP::open(int port, const std::string& host, const std::function<void(const
   addr.sin_port = htons(port);
   memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
 
-  if (connect(sockfd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0)
+  // A non-blocking connect allows an explicit upper bound on unreachable servers.
+  const int original_flags = fcntl(sockfd_, F_GETFL, 0);
+  if (original_flags < 0 || fcntl(sockfd_, F_SETFL, original_flags | O_NONBLOCK) < 0)
+  {
+    close();
+    return false;
+  }
+
+  const int connect_result = connect(sockfd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
+  if (connect_result < 0 && errno != EINPROGRESS)
+  {
+    close();
+    return false;
+  }
+
+  if (connect_result < 0)
+  {
+    fd_set writable;
+    FD_ZERO(&writable);
+    FD_SET(sockfd_, &writable);
+
+    timeval timeout;
+    timeout.tv_sec = static_cast<time_t>(timeout_seconds);
+    timeout.tv_usec = static_cast<suseconds_t>((timeout_seconds - timeout.tv_sec) * 1000000.0);
+
+    const int select_result = select(sockfd_ + 1, nullptr, &writable, nullptr, &timeout);
+    int socket_error = 0;
+    socklen_t socket_error_length = sizeof(socket_error);
+
+    if (select_result != 1 ||
+        getsockopt(sockfd_, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_length) < 0 ||
+        socket_error != 0)
+    {
+      close();
+      return false;
+    }
+  }
+
+  // Receive uses blocking I/O and is interrupted explicitly by shutdown().
+  if (fcntl(sockfd_, F_SETFL, original_flags) < 0)
   {
     close();
     return false;

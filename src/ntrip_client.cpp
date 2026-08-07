@@ -3,6 +3,7 @@
 #include "um982_gnss/ntrip_client.hpp"
 
 #include <chrono>
+#include <sstream>
 
 using std::placeholders::_1;
 
@@ -57,6 +58,7 @@ NtripClient::NtripClient(const rclcpp::NodeOptions& options) : rclcpp_lifecycle:
   this->declare_parameter("reconnect_attempt_max", reconnect_attempt_max_);
   this->declare_parameter("reconnect_attempt_wait_seconds", reconnect_attempt_wait_seconds_);
   this->declare_parameter("reconnect_pause", reconnect_pause_);
+  this->declare_parameter("connect_timeout_seconds", connect_timeout_seconds_);
 }
 
 LNI::CallbackReturn NtripClient::on_configure(const rclcpp_lifecycle::State&)
@@ -72,13 +74,14 @@ LNI::CallbackReturn NtripClient::on_configure(const rclcpp_lifecycle::State&)
   this->get_parameter("reconnect_attempt_max", reconnect_attempt_max_);
   this->get_parameter("reconnect_attempt_wait_seconds", reconnect_attempt_wait_seconds_);
   this->get_parameter("reconnect_pause", reconnect_pause_);
+  this->get_parameter("connect_timeout_seconds", connect_timeout_seconds_);
 
   // Every timer period and the number of attempts must define a usable retry policy.
-  if (rtcm_timeout_seconds_ <= 0.0 || reconnect_attempt_max_ <= 0 || reconnect_attempt_wait_seconds_ <= 0.0 || reconnect_pause_ <= 0.0)
+  if (rtcm_timeout_seconds_ <= 0.0 || reconnect_attempt_max_ <= 0 || reconnect_attempt_wait_seconds_ <= 0.0 ||
+      reconnect_pause_ <= 0.0 || connect_timeout_seconds_ <= 0.0)
   {
     RCLCPP_ERROR(this->get_logger(),
-                 "Parameters 'rtcm_timeout_seconds', 'reconnect_attempt_max', 'reconnect_attempt_wait_seconds' and 'reconnect_pause' must be "
-                 "greater than zero");
+                 "Timeout, retry delay, retry pause and maximum attempt parameters must be greater than zero");
     return LNI::CallbackReturn::FAILURE;
   }
 
@@ -118,7 +121,7 @@ LNI::CallbackReturn NtripClient::on_activate(const rclcpp_lifecycle::State& stat
   reconnect_timer_->cancel();
   reconnect_pause_timer_->cancel();
 
-  initialized_ = false;
+  connection_state_ = ConnectionState::DISCONNECTED;
   stop_thread_ = false;
   reconnect_attempts_ = 0;
   reconnect_requested_ = false;
@@ -172,7 +175,7 @@ LNI::CallbackReturn NtripClient::on_shutdown(const rclcpp_lifecycle::State&)
 
 void NtripClient::close_tcp()
 {
-  initialized_ = false;
+  connection_state_ = ConnectionState::DISCONNECTED;
   stop_thread_ = true;
   reconnect_condition_.notify_all();
 
@@ -201,6 +204,11 @@ void NtripClient::init_thread_callback()
 
     reconnect_requested_ = false;
 
+    if (connection_state_ == ConnectionState::RETRY_BLOCKED)
+    {
+      continue;
+    }
+
     const int reconnect_attempt = ++reconnect_attempts_;
     RCLCPP_INFO_STREAM(this->get_logger(),
                        "NTRIP connection attempt " << reconnect_attempt << "/" << reconnect_attempt_max_);
@@ -208,7 +216,9 @@ void NtripClient::init_thread_callback()
     // Joining the previous receiver prevents it from modifying the parser during its reset.
     tcp_.close();
     reset_rtcm_parser();
-    if (!tcp_.open(port_, host_, &NtripClient::callback, this))
+    ntrip_response_buffer_.clear();
+    connection_state_ = ConnectionState::DISCONNECTED;
+    if (!tcp_.open(port_, host_, connect_timeout_seconds_, &NtripClient::callback, this))
     {
       RCLCPP_ERROR_STREAM(this->get_logger(), "Unable to connect socket to server at http://" << host_ << ":" << port_);
       schedule_reconnect();
@@ -235,25 +245,29 @@ void NtripClient::init_thread_callback()
           "GET /" + mountpoint_ + " HTTP/1.0\r\n" + "User-Agent: NTRIP ROS2Client\r\n" + "Connection: close\r\n\r\n";
     }
 
+    // The response timeout starts with the request and also covers a completely silent caster.
+    connection_state_ = ConnectionState::WAITING_RESPONSE;
     if (!tcp_.send(request))
     {
+      connection_state_ = ConnectionState::DISCONNECTED;
       RCLCPP_ERROR_STREAM(this->get_logger(), "Unable to send request to server at http://" << host_ << ":" << port_);
       tcp_.close();
       schedule_reconnect();
       continue;
     }
 
-    RCLCPP_INFO_STREAM(this->get_logger(), "Connected to http://" << host_ << ":" << port_ << "/" << mountpoint_);
+    RCLCPP_INFO_STREAM(this->get_logger(), "NTRIP request sent to http://" << host_ << ":" << port_ << "/" << mountpoint_);
 
-    // Start the watchdog from connection establishment to allow the first RTCM frame to arrive.
-    initialized_ = true;
-    rtcm_watchdog_timer_->reset();
+    if (connection_state_ == ConnectionState::WAITING_RESPONSE)
+    {
+      rtcm_watchdog_timer_->reset();
+    }
   }
 }
 
 void NtripClient::request_connection_attempt()
 {
-  if (stop_thread_)
+  if (stop_thread_ || connection_state_ == ConnectionState::RETRY_BLOCKED)
   {
     return;
   }
@@ -265,21 +279,30 @@ void NtripClient::request_connection_attempt()
   }
 }
 
-void NtripClient::schedule_reconnect()
+void NtripClient::schedule_reconnect(bool force_pause)
 {
-  if (stop_thread_)
+  if (stop_thread_ || connection_state_ == ConnectionState::RETRY_BLOCKED)
   {
     return;
   }
 
+  connection_state_ = ConnectionState::DISCONNECTED;
   rtcm_watchdog_timer_->cancel();
-  const bool batch_exhausted = reconnect_attempts_ >= reconnect_attempt_max_;
+  const bool batch_exhausted = force_pause || reconnect_attempts_ >= reconnect_attempt_max_;
 
   if (batch_exhausted)
   {
-    RCLCPP_WARN_STREAM(this->get_logger(),
-                       "No valid NTRIP connection after " << reconnect_attempt_max_ << " attempts; retrying in "
-                                                          << reconnect_pause_ << " seconds");
+    if (force_pause)
+    {
+      RCLCPP_WARN_STREAM(this->get_logger(),
+                         "NTRIP retries paused by server response for " << reconnect_pause_ << " seconds");
+    }
+    else
+    {
+      RCLCPP_WARN_STREAM(this->get_logger(),
+                         "No valid NTRIP connection after " << reconnect_attempt_max_ << " attempts; retrying in "
+                                                            << reconnect_pause_ << " seconds");
+    }
     reconnect_timer_->cancel();
     reconnect_pause_timer_->reset();
   }
@@ -288,6 +311,18 @@ void NtripClient::schedule_reconnect()
     // Retry once after the configured delay; the callback cancels this periodic timer.
     reconnect_timer_->reset();
   }
+}
+
+void NtripClient::block_reconnect(const std::string& reason)
+{
+  connection_state_ = ConnectionState::RETRY_BLOCKED;
+  rtcm_watchdog_timer_->cancel();
+  reconnect_timer_->cancel();
+  reconnect_pause_timer_->cancel();
+  tcp_.interrupt();
+
+  // Configuration or protocol errors require a lifecycle reconfiguration before retrying.
+  RCLCPP_ERROR_STREAM(this->get_logger(), reason << "; automatic NTRIP reconnection is blocked");
 }
 
 void NtripClient::reset_rtcm_parser()
@@ -303,12 +338,22 @@ void NtripClient::rtcm_watchdog_callback()
   // create_wall_timer is periodic, so cancel it to implement a resettable one-shot watchdog.
   rtcm_watchdog_timer_->cancel();
 
-  if (initialized_.exchange(false))
+  ConnectionState state = connection_state_.load();
+  if (state != ConnectionState::WAITING_RESPONSE && state != ConnectionState::STREAMING)
   {
-    RCLCPP_WARN_STREAM(this->get_logger(),
-                       "No valid RTCM message received for " << rtcm_timeout_seconds_ << " seconds; reconnecting to NTRIP");
-    schedule_reconnect();
+    return;
   }
+
+  if (!connection_state_.compare_exchange_strong(state, ConnectionState::DISCONNECTED))
+  {
+    return;
+  }
+
+  tcp_.interrupt();
+  const char* missing_data = state == ConnectionState::WAITING_RESPONSE ? "NTRIP server response" : "valid RTCM message";
+  RCLCPP_WARN_STREAM(this->get_logger(),
+                     "No " << missing_data << " received for " << rtcm_timeout_seconds_ << " seconds; reconnecting");
+  schedule_reconnect();
 }
 
 void NtripClient::reconnect_timer_callback()
@@ -323,13 +368,116 @@ void NtripClient::reconnect_pause_timer_callback()
   // The cooldown opens a new batch of five consecutive attempts.
   reconnect_pause_timer_->cancel();
 
-  if (stop_thread_)
+  if (stop_thread_ || connection_state_ == ConnectionState::RETRY_BLOCKED)
   {
     return;
   }
 
   reconnect_attempts_ = 0;
   request_connection_attempt();
+}
+
+void NtripClient::process_ntrip_response(const std::vector<uint8_t>& data)
+{
+  constexpr size_t max_response_header_size = 8192;
+  ntrip_response_buffer_.append(data.begin(), data.end());
+
+  const size_t status_line_end = ntrip_response_buffer_.find("\r\n");
+  if (status_line_end == std::string::npos)
+  {
+    if (ntrip_response_buffer_.size() > max_response_header_size)
+    {
+      block_reconnect("NTRIP status line exceeds 8192 bytes");
+    }
+    return;
+  }
+
+  const std::string status_line = ntrip_response_buffer_.substr(0, status_line_end);
+  if (status_line.compare(0, 11, "SOURCETABLE") == 0)
+  {
+    block_reconnect("Caster returned a sourcetable instead of the requested mountpoint");
+    return;
+  }
+
+  const bool icy_response = status_line.compare(0, 4, "ICY ") == 0;
+  const bool http_response = status_line.compare(0, 5, "HTTP/") == 0;
+  if (!icy_response && !http_response)
+  {
+    block_reconnect("Unsupported NTRIP response: " + status_line);
+    return;
+  }
+
+  size_t payload_offset = status_line_end + 2;
+  if (http_response)
+  {
+    const size_t header_end = ntrip_response_buffer_.find("\r\n\r\n");
+    if (header_end == std::string::npos)
+    {
+      if (ntrip_response_buffer_.size() > max_response_header_size)
+      {
+        block_reconnect("NTRIP response header exceeds 8192 bytes");
+      }
+      return;
+    }
+    if (header_end > max_response_header_size)
+    {
+      block_reconnect("NTRIP response header exceeds 8192 bytes");
+      return;
+    }
+    payload_offset = header_end + 4;
+  }
+
+  std::istringstream status_stream(status_line);
+  std::string protocol;
+  int status_code = 0;
+  status_stream >> protocol >> status_code;
+  if (!status_stream || status_code < 100 || status_code > 599)
+  {
+    block_reconnect("Malformed NTRIP status line: " + status_line);
+    return;
+  }
+
+  handle_ntrip_status(status_code, status_line, payload_offset);
+}
+
+void NtripClient::handle_ntrip_status(int status_code, const std::string& status_line, size_t payload_offset)
+{
+  if (status_code == 200)
+  {
+    connection_state_ = ConnectionState::STREAMING;
+    RCLCPP_INFO_STREAM(this->get_logger(), "NTRIP stream accepted: " << status_line);
+
+    // The same watchdog now monitors the delay until the first valid RTCM frame.
+    rtcm_watchdog_timer_->reset();
+    for (size_t i = payload_offset; i < ntrip_response_buffer_.size(); i++)
+    {
+      parse_rtcm(static_cast<uint8_t>(ntrip_response_buffer_[i]));
+    }
+    ntrip_response_buffer_.clear();
+    return;
+  }
+
+  ntrip_response_buffer_.clear();
+  tcp_.interrupt();
+
+  if (status_code == 408 || status_code >= 500)
+  {
+    RCLCPP_WARN_STREAM(this->get_logger(), "Transient NTRIP server error: " << status_line);
+    connection_state_ = ConnectionState::DISCONNECTED;
+    schedule_reconnect();
+    return;
+  }
+
+  if (status_code == 429)
+  {
+    RCLCPP_WARN_STREAM(this->get_logger(), "NTRIP caster rate limit reached: " << status_line);
+    connection_state_ = ConnectionState::DISCONNECTED;
+    schedule_reconnect(true);
+    return;
+  }
+
+  // Authentication, authorization, mountpoint and unsupported protocol errors are not recoverable unchanged.
+  block_reconnect("Permanent NTRIP rejection: " + status_line);
 }
 
 void NtripClient::parse_rtcm(uint8_t data)
@@ -409,31 +557,31 @@ void NtripClient::parse_rtcm(uint8_t data)
 
 void NtripClient::callback(const std::vector<uint8_t>& data)
 {
-  if (!initialized_)
+  ConnectionState state = connection_state_.load();
+  if (state == ConnectionState::DISCONNECTED || state == ConnectionState::RETRY_BLOCKED)
   {
     return;
   }
 
   if (data.size() == 0)
   {
-    if (initialized_.exchange(false))
+    if (connection_state_.compare_exchange_strong(state, ConnectionState::DISCONNECTED))
     {
-      rtcm_msg_.data.clear();
       RCLCPP_WARN(this->get_logger(), "Connection closed by server");
       schedule_reconnect();
     }
     return;
   }
 
+  if (state == ConnectionState::WAITING_RESPONSE)
+  {
+    process_ntrip_response(data);
+    return;
+  }
+
   for (uint8_t d : data)
   {
     parse_rtcm(d);
-  }
-
-  if (rtcm_msg_.data.empty())
-  {
-    std::string str(data.begin(), data.end());
-    RCLCPP_INFO_STREAM(this->get_logger(), str);
   }
 }
 
@@ -483,15 +631,18 @@ uint32_t NtripClient::crc24q(const mavros_msgs::msg::RTCM& msg)
 
 void NtripClient::gga_callback(const nmea_msgs::msg::Sentence::SharedPtr msg)
 {
-  if (!initialized_)
+  if (connection_state_ != ConnectionState::STREAMING)
   {
     return;
   }
 
-  if (!tcp_.send(msg->sentence + "\r\n") && initialized_.exchange(false))
+  ConnectionState expected = ConnectionState::STREAMING;
+  if (!tcp_.send(msg->sentence + "\r\n") &&
+      connection_state_.compare_exchange_strong(expected, ConnectionState::DISCONNECTED))
   {
     // A failed GGA write is another reliable indication that the socket must be reopened.
     RCLCPP_WARN(this->get_logger(), "Unable to send GGA sentence; reconnecting to NTRIP");
+    tcp_.interrupt();
     schedule_reconnect();
   }
 }

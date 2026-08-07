@@ -10,3 +10,5 @@
     reconnect_attempt_max: 5
     reconnect_attempt_wait_seconds: 5.0
     reconnect_pause: 120.0
+    # Bound the TCP handshake when the caster is unreachable.
+    connect_timeout_seconds: 10.0
