@@ -2,8 +2,9 @@
 
 #include "um982_gnss/ntrip_client.hpp"
 
+#include <chrono>
+
 using std::placeholders::_1;
-using namespace std::chrono_literals;
 
 /*
 RTCM3 transport layer bit format:
@@ -52,6 +53,10 @@ NtripClient::NtripClient(const rclcpp::NodeOptions& options) : rclcpp_lifecycle:
   this->declare_parameter("username", username_);
   this->declare_parameter("password", password_);
   this->declare_parameter("frame_id", frame_id_);
+  this->declare_parameter("rtcm_timeout", rtcm_timeout_);
+  this->declare_parameter("reconnect_attempt_max", reconnect_attempt_max_);
+  this->declare_parameter("reconnect_delay", reconnect_delay_);
+  this->declare_parameter("reconnect_pause", reconnect_pause_);
 }
 
 LNI::CallbackReturn NtripClient::on_configure(const rclcpp_lifecycle::State&)
@@ -63,6 +68,19 @@ LNI::CallbackReturn NtripClient::on_configure(const rclcpp_lifecycle::State&)
   this->get_parameter("username", username_);
   this->get_parameter("password", password_);
   this->get_parameter("frame_id", frame_id_);
+  this->get_parameter("rtcm_timeout", rtcm_timeout_);
+  this->get_parameter("reconnect_attempt_max", reconnect_attempt_max_);
+  this->get_parameter("reconnect_delay", reconnect_delay_);
+  this->get_parameter("reconnect_pause", reconnect_pause_);
+
+  // Every timer period and the number of attempts must define a usable retry policy.
+  if (rtcm_timeout_ <= 0.0 || reconnect_attempt_max_ <= 0 || reconnect_delay_ <= 0.0 || reconnect_pause_ <= 0.0)
+  {
+    RCLCPP_ERROR(this->get_logger(),
+                 "Parameters 'rtcm_timeout', 'reconnect_attempt_max', 'reconnect_delay' and 'reconnect_pause' must be "
+                 "greater than zero");
+    return LNI::CallbackReturn::FAILURE;
+  }
 
   rtcm_msg_.header.frame_id = frame_id_;
   rtcm_pub_ = this->create_publisher<mavros_msgs::msg::RTCM>("rtcm", 10);
@@ -86,12 +104,26 @@ LNI::CallbackReturn NtripClient::on_activate(const rclcpp_lifecycle::State& stat
   bond_ = std::make_unique<bond::Bond>("bond", id, shared_from_this());
   bond_->start();
 
-  initialized_ = false;
-  stop_thread_ = false;
-  init_thread_ = std::thread(&NtripClient::init_thread_callback, this);
-
   gga_sub_ =
       this->create_subscription<nmea_msgs::msg::Sentence>("nmea", 10, std::bind(&NtripClient::gga_callback, this, _1));
+
+  // Each delay has its own wall timer; callbacks cancel them to provide one-shot behavior.
+  rtcm_watchdog_timer_ = this->create_wall_timer(std::chrono::duration<double>(rtcm_timeout_),
+                                                 std::bind(&NtripClient::rtcm_watchdog_callback, this));
+  reconnect_timer_ = this->create_wall_timer(std::chrono::duration<double>(reconnect_delay_),
+                                             std::bind(&NtripClient::reconnect_timer_callback, this));
+  reconnect_pause_timer_ = this->create_wall_timer(std::chrono::duration<double>(reconnect_pause_),
+                                                   std::bind(&NtripClient::reconnect_pause_timer_callback, this));
+  rtcm_watchdog_timer_->cancel();
+  reconnect_timer_->cancel();
+  reconnect_pause_timer_->cancel();
+
+  initialized_ = false;
+  stop_thread_ = false;
+  reconnect_attempts_ = 0;
+  reconnect_requested_ = false;
+  init_thread_ = std::thread(&NtripClient::init_thread_callback, this);
+  request_connection_attempt();
 
   return LNI::CallbackReturn::SUCCESS;
 }
@@ -100,8 +132,12 @@ LNI::CallbackReturn NtripClient::on_deactivate(const rclcpp_lifecycle::State& st
 {
   LifecycleNode::on_deactivate(state);
 
-  bond_->breakBond();
+  // Stop network threads before destroying timers they can reset.
   close_tcp();
+  rtcm_watchdog_timer_.reset();
+  reconnect_timer_.reset();
+  reconnect_pause_timer_.reset();
+  bond_->breakBond();
 
   return LNI::CallbackReturn::SUCCESS;
 }
@@ -109,6 +145,9 @@ LNI::CallbackReturn NtripClient::on_deactivate(const rclcpp_lifecycle::State& st
 LNI::CallbackReturn NtripClient::on_cleanup(const rclcpp_lifecycle::State&)
 {
   close_tcp();
+  rtcm_watchdog_timer_.reset();
+  reconnect_timer_.reset();
+  reconnect_pause_timer_.reset();
 
   rtcm_pub_.reset();
   gga_sub_.reset();
@@ -120,6 +159,9 @@ LNI::CallbackReturn NtripClient::on_cleanup(const rclcpp_lifecycle::State&)
 LNI::CallbackReturn NtripClient::on_shutdown(const rclcpp_lifecycle::State&)
 {
   close_tcp();
+  rtcm_watchdog_timer_.reset();
+  reconnect_timer_.reset();
+  reconnect_pause_timer_.reset();
 
   rtcm_pub_.reset();
   gga_sub_.reset();
@@ -130,7 +172,9 @@ LNI::CallbackReturn NtripClient::on_shutdown(const rclcpp_lifecycle::State&)
 
 void NtripClient::close_tcp()
 {
+  initialized_ = false;
   stop_thread_ = true;
+  reconnect_condition_.notify_all();
 
   if (init_thread_.joinable())
   {
@@ -142,41 +186,39 @@ void NtripClient::close_tcp()
 
 void NtripClient::init_thread_callback()
 {
-  uint16_t sleep = 500;
-  uint8_t reconnect_attempt = 0;
-  uint8_t reconnect_attempt_max = 5;
-
   while (!stop_thread_)
   {
-    if (sleep < 500)
     {
-      sleep++;
-      std::this_thread::sleep_for(10ms);
-      continue;
+      // Wall-timer callbacks wake the worker only when an attempt is due.
+      std::unique_lock<std::mutex> lock(reconnect_mutex_);
+      reconnect_condition_.wait(lock, [this]() { return stop_thread_ || reconnect_requested_; });
     }
 
-    if (reconnect_attempt > reconnect_attempt_max)
+    if (stop_thread_)
     {
       break;
     }
 
-    if (initialized_)
-    {
-      sleep = 0;
-      continue;
-    }
+    reconnect_requested_ = false;
 
-    if (reconnect_attempt > 0)
-    {
-      RCLCPP_INFO_STREAM(this->get_logger(),
-                         "Reconnect attempt " << +reconnect_attempt << "/" << +reconnect_attempt_max);
-    }
+    const int reconnect_attempt = ++reconnect_attempts_;
+    RCLCPP_INFO_STREAM(this->get_logger(),
+                       "NTRIP connection attempt " << reconnect_attempt << "/" << reconnect_attempt_max_);
 
+    // Joining the previous receiver prevents it from modifying the parser during its reset.
+    tcp_.close();
+    reset_rtcm_parser();
     if (!tcp_.open(port_, host_, &NtripClient::callback, this))
     {
       RCLCPP_ERROR_STREAM(this->get_logger(), "Unable to connect socket to server at http://" << host_ << ":" << port_);
-      sleep = 0;
+      schedule_reconnect();
       continue;
+    }
+
+    if (stop_thread_)
+    {
+      tcp_.close();
+      break;
     }
 
     std::string request;
@@ -196,15 +238,98 @@ void NtripClient::init_thread_callback()
     if (!tcp_.send(request))
     {
       RCLCPP_ERROR_STREAM(this->get_logger(), "Unable to send request to server at http://" << host_ << ":" << port_);
-      sleep = 0;
+      tcp_.close();
+      schedule_reconnect();
       continue;
     }
 
     RCLCPP_INFO_STREAM(this->get_logger(), "Connected to http://" << host_ << ":" << port_ << "/" << mountpoint_);
 
-    reconnect_attempt++;
+    // Start the watchdog from connection establishment to allow the first RTCM frame to arrive.
     initialized_ = true;
+    rtcm_watchdog_timer_->reset();
   }
+}
+
+void NtripClient::request_connection_attempt()
+{
+  if (stop_thread_)
+  {
+    return;
+  }
+
+  // The atomic flag prevents concurrent timer callbacks from queuing duplicate attempts.
+  if (!reconnect_requested_.exchange(true))
+  {
+    reconnect_condition_.notify_one();
+  }
+}
+
+void NtripClient::schedule_reconnect()
+{
+  if (stop_thread_)
+  {
+    return;
+  }
+
+  rtcm_watchdog_timer_->cancel();
+  const bool batch_exhausted = reconnect_attempts_ >= reconnect_attempt_max_;
+
+  if (batch_exhausted)
+  {
+    RCLCPP_WARN_STREAM(this->get_logger(),
+                       "No valid NTRIP connection after " << reconnect_attempt_max_ << " attempts; retrying in "
+                                                          << reconnect_pause_ << " seconds");
+    reconnect_timer_->cancel();
+    reconnect_pause_timer_->reset();
+  }
+  else
+  {
+    // Retry once after the configured delay; the callback cancels this periodic timer.
+    reconnect_timer_->reset();
+  }
+}
+
+void NtripClient::reset_rtcm_parser()
+{
+  // Discard any partial frame left by the previous TCP stream.
+  rtcm_msg_.data.clear();
+  crc_.clear();
+  state_ = PREAMBLE;
+}
+
+void NtripClient::rtcm_watchdog_callback()
+{
+  // create_wall_timer is periodic, so cancel it to implement a resettable one-shot watchdog.
+  rtcm_watchdog_timer_->cancel();
+
+  if (initialized_.exchange(false))
+  {
+    RCLCPP_WARN_STREAM(this->get_logger(),
+                       "No valid RTCM message received for " << rtcm_timeout_ << " seconds; reconnecting to NTRIP");
+    schedule_reconnect();
+  }
+}
+
+void NtripClient::reconnect_timer_callback()
+{
+  // A retry timer represents exactly one attempt.
+  reconnect_timer_->cancel();
+  request_connection_attempt();
+}
+
+void NtripClient::reconnect_pause_timer_callback()
+{
+  // The cooldown opens a new batch of five consecutive attempts.
+  reconnect_pause_timer_->cancel();
+
+  if (stop_thread_)
+  {
+    return;
+  }
+
+  reconnect_attempts_ = 0;
+  request_connection_attempt();
 }
 
 void NtripClient::parse_rtcm(uint8_t data)
@@ -264,6 +389,9 @@ void NtripClient::parse_rtcm(uint8_t data)
           rtcm_msg_.data.push_back(crc_[1]);
           rtcm_msg_.data.push_back(crc_[2]);
           rtcm_pub_->publish(rtcm_msg_);
+          // Only a complete frame with a valid CRC proves that the correction stream is healthy.
+          reconnect_attempts_ = 0;
+          rtcm_watchdog_timer_->reset();
         }
         else
         {
@@ -288,9 +416,12 @@ void NtripClient::callback(const std::vector<uint8_t>& data)
 
   if (data.size() == 0)
   {
-    initialized_ = false;
-    rtcm_msg_.data.clear();
-    RCLCPP_WARN(this->get_logger(), "Connection closed by server");
+    if (initialized_.exchange(false))
+    {
+      rtcm_msg_.data.clear();
+      RCLCPP_WARN(this->get_logger(), "Connection closed by server");
+      schedule_reconnect();
+    }
     return;
   }
 
@@ -357,7 +488,12 @@ void NtripClient::gga_callback(const nmea_msgs::msg::Sentence::SharedPtr msg)
     return;
   }
 
-  tcp_.send(msg->sentence + "\r\n");
+  if (!tcp_.send(msg->sentence + "\r\n") && initialized_.exchange(false))
+  {
+    // A failed GGA write is another reliable indication that the socket must be reopened.
+    RCLCPP_WARN(this->get_logger(), "Unable to send GGA sentence; reconnecting to NTRIP");
+    schedule_reconnect();
+  }
 }
 }  // namespace um982_gnss
 

@@ -10,6 +10,15 @@
 #include "mavros_msgs/msg/rtcm.hpp"
 #include "bondcpp/bond.hpp"
 
+#include <atomic>
+#include <condition_variable>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <vector>
+#include <string>
+
 using LNI = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface;
 
 namespace um982_gnss
@@ -47,6 +56,12 @@ public:
 protected:
   void close_tcp();
   void init_thread_callback();
+  void request_connection_attempt();
+  void schedule_reconnect();
+  void reset_rtcm_parser();
+  void rtcm_watchdog_callback();
+  void reconnect_timer_callback();
+  void reconnect_pause_timer_callback();
   void parse_rtcm(uint8_t data);
   void callback(const std::vector<uint8_t>& data);
   std::string base64_encode(const std::string& in);
@@ -60,7 +75,7 @@ private:
     HEADER,
     PAYLOAD,
     CRC
-  } state_;
+  } state_{ PREAMBLE };
 
   std::string host_{ "127.0.0.1" };
   int port_{ 2101 };
@@ -69,17 +84,30 @@ private:
   std::string username_{ "" };
   std::string password_{ "" };
   std::string frame_id_{ "odom" };
+  int reconnect_attempt_max_{ 5 };
+  double rtcm_timeout_{ 15.0 };
+  double reconnect_delay_{ 5.0 };
+  double reconnect_pause_{ 120.0 };
 
   TCP tcp_;
   std::thread init_thread_;
-  std::atomic<bool> initialized_;
-  std::atomic<bool> stop_thread_;
+  std::atomic<bool> initialized_{ false };
+  std::atomic<bool> stop_thread_{ true };
+  // The counter is cleared only after a complete RTCM frame proves the connection is usable.
+  std::atomic<int> reconnect_attempts_{ 0 };
+  std::atomic<bool> reconnect_requested_{ false };
+  std::condition_variable reconnect_condition_;
+  std::mutex reconnect_mutex_;
   std::vector<uint8_t> crc_;
   std::unique_ptr<bond::Bond> bond_;
 
   mavros_msgs::msg::RTCM rtcm_msg_;
   rclcpp_lifecycle::LifecyclePublisher<mavros_msgs::msg::RTCM>::SharedPtr rtcm_pub_;
   rclcpp::Subscription<nmea_msgs::msg::Sentence>::SharedPtr gga_sub_;
+  // Dedicated wall timers make watchdog, retry delay and cooldown independent.
+  rclcpp::TimerBase::SharedPtr rtcm_watchdog_timer_;
+  rclcpp::TimerBase::SharedPtr reconnect_timer_;
+  rclcpp::TimerBase::SharedPtr reconnect_pause_timer_;
 };
 }  // namespace um982_gnss
 
