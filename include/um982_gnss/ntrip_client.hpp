@@ -85,8 +85,8 @@ private:
   std::string password_{ "" };
   std::string frame_id_{ "odom" };
   int reconnect_attempt_max_{ 5 };
-  double rtcm_timeout_{ 15.0 };
-  double reconnect_delay_{ 5.0 };
+  double rtcm_timeout_seconds_{ 15.0 };
+  double reconnect_attempt_wait_seconds_{ 5.0 };
   double reconnect_pause_{ 120.0 };
 
   TCP tcp_;

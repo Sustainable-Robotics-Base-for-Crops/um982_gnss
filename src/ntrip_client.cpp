@@ -53,9 +53,9 @@ NtripClient::NtripClient(const rclcpp::NodeOptions& options) : rclcpp_lifecycle:
   this->declare_parameter("username", username_);
   this->declare_parameter("password", password_);
   this->declare_parameter("frame_id", frame_id_);
-  this->declare_parameter("rtcm_timeout", rtcm_timeout_);
+  this->declare_parameter("rtcm_timeout_seconds", rtcm_timeout_seconds_);
   this->declare_parameter("reconnect_attempt_max", reconnect_attempt_max_);
-  this->declare_parameter("reconnect_delay", reconnect_delay_);
+  this->declare_parameter("reconnect_attempt_wait_seconds", reconnect_attempt_wait_seconds_);
   this->declare_parameter("reconnect_pause", reconnect_pause_);
 }
 
@@ -68,16 +68,16 @@ LNI::CallbackReturn NtripClient::on_configure(const rclcpp_lifecycle::State&)
   this->get_parameter("username", username_);
   this->get_parameter("password", password_);
   this->get_parameter("frame_id", frame_id_);
-  this->get_parameter("rtcm_timeout", rtcm_timeout_);
+  this->get_parameter("rtcm_timeout_seconds", rtcm_timeout_seconds_);
   this->get_parameter("reconnect_attempt_max", reconnect_attempt_max_);
-  this->get_parameter("reconnect_delay", reconnect_delay_);
+  this->get_parameter("reconnect_attempt_wait_seconds", reconnect_attempt_wait_seconds_);
   this->get_parameter("reconnect_pause", reconnect_pause_);
 
   // Every timer period and the number of attempts must define a usable retry policy.
-  if (rtcm_timeout_ <= 0.0 || reconnect_attempt_max_ <= 0 || reconnect_delay_ <= 0.0 || reconnect_pause_ <= 0.0)
+  if (rtcm_timeout_seconds_ <= 0.0 || reconnect_attempt_max_ <= 0 || reconnect_attempt_wait_seconds_ <= 0.0 || reconnect_pause_ <= 0.0)
   {
     RCLCPP_ERROR(this->get_logger(),
-                 "Parameters 'rtcm_timeout', 'reconnect_attempt_max', 'reconnect_delay' and 'reconnect_pause' must be "
+                 "Parameters 'rtcm_timeout_seconds', 'reconnect_attempt_max', 'reconnect_attempt_wait_seconds' and 'reconnect_pause' must be "
                  "greater than zero");
     return LNI::CallbackReturn::FAILURE;
   }
@@ -108,9 +108,9 @@ LNI::CallbackReturn NtripClient::on_activate(const rclcpp_lifecycle::State& stat
       this->create_subscription<nmea_msgs::msg::Sentence>("nmea", 10, std::bind(&NtripClient::gga_callback, this, _1));
 
   // Each delay has its own wall timer; callbacks cancel them to provide one-shot behavior.
-  rtcm_watchdog_timer_ = this->create_wall_timer(std::chrono::duration<double>(rtcm_timeout_),
+  rtcm_watchdog_timer_ = this->create_wall_timer(std::chrono::duration<double>(rtcm_timeout_seconds_),
                                                  std::bind(&NtripClient::rtcm_watchdog_callback, this));
-  reconnect_timer_ = this->create_wall_timer(std::chrono::duration<double>(reconnect_delay_),
+  reconnect_timer_ = this->create_wall_timer(std::chrono::duration<double>(reconnect_attempt_wait_seconds_),
                                              std::bind(&NtripClient::reconnect_timer_callback, this));
   reconnect_pause_timer_ = this->create_wall_timer(std::chrono::duration<double>(reconnect_pause_),
                                                    std::bind(&NtripClient::reconnect_pause_timer_callback, this));
@@ -306,7 +306,7 @@ void NtripClient::rtcm_watchdog_callback()
   if (initialized_.exchange(false))
   {
     RCLCPP_WARN_STREAM(this->get_logger(),
-                       "No valid RTCM message received for " << rtcm_timeout_ << " seconds; reconnecting to NTRIP");
+                       "No valid RTCM message received for " << rtcm_timeout_seconds_ << " seconds; reconnecting to NTRIP");
     schedule_reconnect();
   }
 }
