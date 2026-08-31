@@ -46,6 +46,9 @@ public:
 
 protected:
   void close_tcp();
+  void rtcm_timeout_timer_callback();
+  void attempt_wait_timer_callback();
+  void attempt_reset_timer_callback();
   void init_thread_callback();
   void parse_rtcm(uint8_t data);
   void callback(const std::vector<uint8_t>& data);
@@ -69,13 +72,23 @@ private:
   std::string username_{ "" };
   std::string password_{ "" };
   std::string frame_id_{ "odom" };
+  double rtcm_timeout_seconds_{ 4.0 };
+  int reconnect_attempt_max_{ 5 };
+  double reconnect_attempt_wait_seconds_{ 5.0 };
+  double reconnect_attempt_reset_seconds_{ 300.0 };
 
   TCP tcp_;
   std::thread init_thread_;
   std::atomic<bool> initialized_;
   std::atomic<bool> stop_thread_;
+  std::atomic<bool> reconnect_attempt_wait_;
+  std::atomic<uint8_t> reconnect_attempt_;
   std::vector<uint8_t> crc_;
   std::unique_ptr<bond::Bond> bond_;
+
+  rclcpp::TimerBase::SharedPtr rtcm_timeout_timer_;
+  rclcpp::TimerBase::SharedPtr attempt_wait_timer_;
+  rclcpp::TimerBase::SharedPtr attempt_reset_timer_;
 
   mavros_msgs::msg::RTCM rtcm_msg_;
   rclcpp_lifecycle::LifecyclePublisher<mavros_msgs::msg::RTCM>::SharedPtr rtcm_pub_;
