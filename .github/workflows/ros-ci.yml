@@ -17,4 +17,3 @@ jobs:
         with:
           package-name: um982_gnss
           target-ros2-distro: jazzy
-          import-token: ${{ secrets.GITHUB_TOKEN }}

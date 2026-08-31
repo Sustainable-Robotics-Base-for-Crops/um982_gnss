@@ -1,14 +1,15 @@
 /**:
   ros__parameters:
+    # Required parameters used to connect to the NTRIP server
     authenticate: False
     host: crtk.net
     mountpoint: NEAR
     port: 2101
-    # Reconnect when no complete and valid RTCM frame is received during this interval.
-    rtcm_timeout_seconds: 15.0
-    # Retry policy: five-second retries, then a two-minute pause after five failures.
+
+    # How many seconds is acceptable in between receiving RTCM. If RTCM is not received for this duration, the node will attempt to reconnect
+    rtcm_timeout_seconds: 4.0
+
+    # Will affect how many times the node will attempt to reconnect, and how long it will wait in between attempts when a reconnect occurs
     reconnect_attempt_max: 5
     reconnect_attempt_wait_seconds: 5.0
-    reconnect_pause: 120.0
-    # Bound the TCP handshake when the caster is unreachable.
-    connect_timeout_seconds: 10.0
+    reconnect_attempt_reset_seconds: 300.0

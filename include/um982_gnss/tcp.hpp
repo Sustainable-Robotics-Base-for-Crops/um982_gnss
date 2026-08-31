@@ -20,16 +20,13 @@ public:
     close();
   }
 
-  bool open(int port, const std::string& host, double timeout_seconds,
-            const std::function<void(const std::vector<uint8_t>&)>& callback);
+  bool open(int port, const std::string& host, const std::function<void(const std::vector<uint8_t>&)>& callback);
   template <class T>
-  bool open(int port, const std::string& host, double timeout_seconds,
-            void (T::*callback)(const std::vector<uint8_t>&), T* obj)
+  bool open(int port, const std::string& host, void (T::*callback)(const std::vector<uint8_t>&), T* obj)
   {
-    return open(port, host, timeout_seconds, std::bind(callback, obj, std::placeholders::_1));
+    return open(port, host, std::bind(callback, obj, std::placeholders::_1));
   }
   bool send(const std::string& msg);
-  void interrupt();
   void close();
 
 private:
