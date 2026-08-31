@@ -58,12 +58,9 @@ LNI::CallbackReturn UM982Gnss::on_activate(const rclcpp_lifecycle::State& state)
 
   initialized_ = false;
   stop_thread_ = false;
-  main_fix_lost_ = false;
   init_thread_ = std::thread(&UM982Gnss::init_thread_callback, this);
 
-  // Poll often enough to start/cancel the 2 min countdown near the fix-loss edge.
-  // The RESET itself is still gated by kMainFixLostTimeout (see timer_callback).
-  timer_ = this->create_wall_timer(kWatchdogPollPeriod, std::bind(&UM982Gnss::timer_callback, this));
+  timer_ = this->create_wall_timer(2min, std::bind(&UM982Gnss::timer_callback, this));
 
   rtcm_sub_ =
       this->create_subscription<mavros_msgs::msg::RTCM>("rtcm", 10, std::bind(&UM982Gnss::rtcm_callback, this, _1));
@@ -127,57 +124,8 @@ void UM982Gnss::close_serial()
 
 void UM982Gnss::timer_callback()
 {
-  // Stuck-receiver watchdog (field intent)
-  // ------------------------------------
-  // Starting the robot indoors often yields no RTK fix. Once outdoors, the
-  // receiver can remain stuck until a RESET (same effect as a power cycle).
-  // This watchdog automates that remedy: if the main antenna stays without an
-  // RTK/GBAS fix for kMainFixLostTimeout, re-run configuration (RESET + setup).
-  //
-  // Why not the previous "every 2 min, if rtk_fix_ != 3 then RESET"?
-  // 1) Timing: a periodic snapshot can fire in the middle of a short outage
-  //    (building, trees) and RESET a receiver that was already recovering.
-  // 2) Criterion: requiring *both* antennas (rtk_fix_ == 3) is correct for
-  //    heading quality, but a late aux fix can last minutes while main is already
-  //    fixed — that must not trigger a RESET. Only a sustained main-fix loss does.
-  //
-  // Countdown starts at the loss edge and is cancelled as soon as main recovers.
-
-  const bool main_has_fix = (rtk_fix_.load() & 0x01) != 0;
-  const auto now = std::chrono::steady_clock::now();
-
-  if (main_has_fix)
-  {
-    if (main_fix_lost_)
-    {
-      RCLCPP_INFO(this->get_logger(), "Main antenna RTK fix recovered; cancelling RESET watchdog timer");
-      main_fix_lost_ = false;
-    }
-    return;
-  }
-
-  if (!main_fix_lost_)
-  {
-    main_fix_lost_ = true;
-    main_fix_lost_since_ = now;
-    RCLCPP_WARN(this->get_logger(),
-                "Main antenna lost RTK fix; starting %ld min recovery timer before RESET",
-                static_cast<long>(kMainFixLostTimeout.count()));
-    return;
-  }
-
-  if (now - main_fix_lost_since_ < kMainFixLostTimeout)
-  {
-    return;
-  }
-
-  RCLCPP_WARN(this->get_logger(),
-              "Main antenna without RTK fix for %ld min; restarting the receiver...",
-              static_cast<long>(kMainFixLostTimeout.count()));
+  RCLCPP_WARN(this->get_logger(), "Restarting the receiver...");
   initialized_ = false;
-  // Arm a fresh countdown so hangar / stuck-outdoors cases can retry every timeout
-  // until a main fix appears, without resetting on every 1 s poll.
-  main_fix_lost_since_ = now;
 }
 
 void UM982Gnss::init_thread_callback()
@@ -576,6 +524,11 @@ void UM982Gnss::process_binary()
   else if (binary_.msg_id == 972)
   {
     parse_uniheading(binary_, uniheading_);
+  }
+
+  if (rtk_fix_ == 3)
+  {
+    timer_->reset();
   }
 }
 

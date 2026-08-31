@@ -7,8 +7,6 @@
   <maintainer email="dev@sabi-agri.com">Sabi Agri</maintainer>
   <license>Apache License 2.0</license>
 
-  <author email="pol***">Pol***</author>
-
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
