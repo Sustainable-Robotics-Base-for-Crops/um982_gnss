@@ -205,8 +205,8 @@ void NtripClient::init_thread_callback()
     if (!tcp_.open(port_, host_, &NtripClient::callback, this))
     {
       RCLCPP_ERROR_STREAM(this->get_logger(), "Unable to connect socket to server at http://" << host_ << ":" << port_);
-      reconnect_attempt_wait_ = true;
       attempt_wait_timer_->reset();
+      reconnect_attempt_wait_ = true;
       continue;
     }
 
@@ -227,18 +227,19 @@ void NtripClient::init_thread_callback()
     if (!tcp_.send(request))
     {
       RCLCPP_ERROR_STREAM(this->get_logger(), "Unable to send request to server at http://" << host_ << ":" << port_);
-      reconnect_attempt_wait_ = true;
       attempt_wait_timer_->reset();
+      reconnect_attempt_wait_ = true;
       continue;
     }
 
     RCLCPP_INFO_STREAM(this->get_logger(), "Connected to http://" << host_ << ":" << port_ << "/" << mountpoint_);
 
+    rtcm_timeout_timer_->reset();
+    attempt_wait_timer_->reset();
+
     initialized_ = true;
     reconnect_attempt_++;
     reconnect_attempt_wait_ = true;
-    rtcm_timeout_timer_->reset();
-    attempt_wait_timer_->reset();
   }
 }
 
