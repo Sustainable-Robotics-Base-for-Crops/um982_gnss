@@ -97,10 +97,14 @@ LNI::CallbackReturn NtripClient::on_activate(const rclcpp_lifecycle::State& stat
   initialized_ = false;
   stop_thread_ = false;
   reconnect_attempt_ = 0;
+  reconnect_attempt_wait_ = false;
   init_thread_ = std::thread(&NtripClient::init_thread_callback, this);
 
   rtcm_timeout_timer_ = this->create_wall_timer(std::chrono::duration<double>(rtcm_timeout_seconds_),
                                                 std::bind(&NtripClient::rtcm_timeout_timer_callback, this));
+
+  attempt_wait_timer_ = this->create_wall_timer(std::chrono::duration<double>(reconnect_attempt_wait_seconds_),
+                                                std::bind(&NtripClient::attempt_wait_timer_callback, this));
 
   attempt_reset_timer_ = this->create_wall_timer(std::chrono::duration<double>(reconnect_attempt_reset_seconds_),
                                                  std::bind(&NtripClient::attempt_reset_timer_callback, this));
@@ -126,6 +130,7 @@ LNI::CallbackReturn NtripClient::on_cleanup(const rclcpp_lifecycle::State&)
   close_tcp();
 
   rtcm_timeout_timer_.reset();
+  attempt_wait_timer_.reset();
   attempt_reset_timer_.reset();
   rtcm_pub_.reset();
   gga_sub_.reset();
@@ -139,6 +144,7 @@ LNI::CallbackReturn NtripClient::on_shutdown(const rclcpp_lifecycle::State&)
   close_tcp();
 
   rtcm_timeout_timer_.reset();
+  attempt_wait_timer_.reset();
   attempt_reset_timer_.reset();
   rtcm_pub_.reset();
   gga_sub_.reset();
@@ -161,9 +167,17 @@ void NtripClient::close_tcp()
 
 void NtripClient::rtcm_timeout_timer_callback()
 {
-  RCLCPP_WARN_STREAM(this->get_logger(),
-                     "RTCM data not received for " << rtcm_timeout_seconds_ << " seconds, reconnecting");
-  initialized_ = false;
+  if (initialized_)
+  {
+    RCLCPP_WARN_STREAM(this->get_logger(),
+                       "RTCM data not received for " << rtcm_timeout_seconds_ << " seconds, reconnecting");
+    initialized_ = false;
+  }
+}
+
+void NtripClient::attempt_wait_timer_callback()
+{
+  reconnect_attempt_wait_ = false;
 }
 
 void NtripClient::attempt_reset_timer_callback()
@@ -177,35 +191,22 @@ void NtripClient::attempt_reset_timer_callback()
 
 void NtripClient::init_thread_callback()
 {
-  double sleep = reconnect_attempt_wait_seconds_ / 0.01;
-
   while (!stop_thread_)
   {
-    if (sleep < reconnect_attempt_wait_seconds_ / 0.01)
-    {
-      sleep++;
-      std::this_thread::sleep_for(10ms);
-      continue;
-    }
+    std::this_thread::sleep_for(100ms);
 
-    if (initialized_ || reconnect_attempt_ > reconnect_attempt_max_)
+    if (initialized_ || reconnect_attempt_wait_ || reconnect_attempt_ > reconnect_attempt_max_)
     {
-      sleep = 0;
       continue;
     }
 
     attempt_reset_timer_->reset();
 
-    if (reconnect_attempt_ > 0)
-    {
-      RCLCPP_INFO_STREAM(this->get_logger(),
-                         "Reconnect attempt " << +reconnect_attempt_ << "/" << +reconnect_attempt_max_);
-    }
-
     if (!tcp_.open(port_, host_, &NtripClient::callback, this))
     {
       RCLCPP_ERROR_STREAM(this->get_logger(), "Unable to connect socket to server at http://" << host_ << ":" << port_);
-      sleep = 0;
+      reconnect_attempt_wait_ = true;
+      attempt_wait_timer_->reset();
       continue;
     }
 
@@ -226,14 +227,18 @@ void NtripClient::init_thread_callback()
     if (!tcp_.send(request))
     {
       RCLCPP_ERROR_STREAM(this->get_logger(), "Unable to send request to server at http://" << host_ << ":" << port_);
-      sleep = 0;
+      reconnect_attempt_wait_ = true;
+      attempt_wait_timer_->reset();
       continue;
     }
 
     RCLCPP_INFO_STREAM(this->get_logger(), "Connected to http://" << host_ << ":" << port_ << "/" << mountpoint_);
 
-    reconnect_attempt_++;
     initialized_ = true;
+    reconnect_attempt_++;
+    reconnect_attempt_wait_ = true;
+    rtcm_timeout_timer_->reset();
+    attempt_wait_timer_->reset();
   }
 }
 

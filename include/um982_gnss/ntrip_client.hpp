@@ -47,6 +47,7 @@ public:
 protected:
   void close_tcp();
   void rtcm_timeout_timer_callback();
+  void attempt_wait_timer_callback();
   void attempt_reset_timer_callback();
   void init_thread_callback();
   void parse_rtcm(uint8_t data);
@@ -80,11 +81,13 @@ private:
   std::thread init_thread_;
   std::atomic<bool> initialized_;
   std::atomic<bool> stop_thread_;
+  std::atomic<bool> reconnect_attempt_wait_;
   std::atomic<uint8_t> reconnect_attempt_;
   std::vector<uint8_t> crc_;
   std::unique_ptr<bond::Bond> bond_;
 
   rclcpp::TimerBase::SharedPtr rtcm_timeout_timer_;
+  rclcpp::TimerBase::SharedPtr attempt_wait_timer_;
   rclcpp::TimerBase::SharedPtr attempt_reset_timer_;
 
   mavros_msgs::msg::RTCM rtcm_msg_;
