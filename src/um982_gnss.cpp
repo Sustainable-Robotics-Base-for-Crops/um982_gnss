@@ -124,11 +124,8 @@ void UM982Gnss::close_serial()
 
 void UM982Gnss::timer_callback()
 {
-  if (rtk_fix_ != 3)
-  {
-    RCLCPP_WARN(this->get_logger(), "Restarting the receiver...");
-    initialized_ = false;
-  }
+  RCLCPP_WARN(this->get_logger(), "Restarting the receiver...");
+  initialized_ = false;
 }
 
 void UM982Gnss::init_thread_callback()
@@ -527,6 +524,11 @@ void UM982Gnss::process_binary()
   else if (binary_.msg_id == 972)
   {
     parse_uniheading(binary_, uniheading_);
+  }
+
+  if (rtk_fix_ == 3)
+  {
+    timer_->reset();
   }
 }
 
