@@ -58,6 +58,21 @@ NtripClient::NtripClient(const rclcpp::NodeOptions& options) : rclcpp_lifecycle:
   this->declare_parameter("reconnect_attempt_reset_seconds", reconnect_attempt_reset_seconds_);
 }
 
+namespace
+{
+/// Retire les blancs ASCII (espace, tabulation, retours) en début et fin uniquement.
+std::string trim_config_string(const std::string& value)
+{
+  const auto begin = value.find_first_not_of(" \t\n\r\f\v");
+  if (begin == std::string::npos)
+  {
+    return "";
+  }
+  const auto end = value.find_last_not_of(" \t\n\r\f\v");
+  return value.substr(begin, end - begin + 1);
+}
+}  // namespace
+
 LNI::CallbackReturn NtripClient::on_configure(const rclcpp_lifecycle::State&)
 {
   this->get_parameter("host", host_);
@@ -71,6 +86,12 @@ LNI::CallbackReturn NtripClient::on_configure(const rclcpp_lifecycle::State&)
   this->get_parameter("reconnect_attempt_max", reconnect_attempt_max_);
   this->get_parameter("reconnect_attempt_wait_seconds", reconnect_attempt_wait_seconds_);
   this->get_parameter("reconnect_attempt_reset_seconds", reconnect_attempt_reset_seconds_);
+
+  // Normalise les champs texte avant connexion (YAML édité à la main, copier-coller).
+  host_ = trim_config_string(host_);
+  mountpoint_ = trim_config_string(mountpoint_);
+  username_ = trim_config_string(username_);
+  password_ = trim_config_string(password_);
 
   rtcm_msg_.header.frame_id = frame_id_;
   rtcm_pub_ = this->create_publisher<mavros_msgs::msg::RTCM>("rtcm", 10);
