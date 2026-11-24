@@ -1,5 +1,11 @@
 // Copyright 2026 SABI AGRI
 
+#include <sys/stat.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <ctime>
+
 #include "um982_gnss/um982_gnss.hpp"
 #include "um982_gnss/crc.hpp"
 
@@ -8,6 +14,92 @@ using namespace std::chrono_literals;
 
 namespace um982_gnss
 {
+namespace
+{
+/// \brief Human readable Unicore position type, kept verbatim in diagnostics so a field
+/// log can be read without the protocol reference at hand.
+const char* pos_type_label(uint32_t pos_type)
+{
+  switch (pos_type)
+  {
+    case NONE:
+      return "NONE";
+    case FIXEDPOS:
+      return "FIXEDPOS";
+    case FIXEHEIGHT:
+      return "FIXEDHEIGHT";
+    case DOPPLER_VELOCITY:
+      return "DOPPLER_VELOCITY";
+    case SINGLE:
+      return "SINGLE";
+    case PSRDIFF:
+      return "PSRDIFF";
+    case SBAS:
+      return "SBAS";
+    case L1_FLOAT:
+      return "L1_FLOAT";
+    case IONOFREE_FLOAT:
+      return "IONOFREE_FLOAT";
+    case NARROW_FLOAT:
+      return "NARROW_FLOAT";
+    case L1_INT:
+      return "L1_INT";
+    case WIDE_INT:
+      return "WIDE_INT";
+    case NARROW_INT:
+      return "NARROW_INT";
+    default:
+      return "OTHER";
+  }
+}
+
+bool is_rtk_fixed(uint32_t pos_type)
+{
+  return pos_type == L1_INT || pos_type == WIDE_INT || pos_type == NARROW_INT;
+}
+
+std::string to_str(double value, int digits)
+{
+  char buffer[32];
+  std::snprintf(buffer, sizeof(buffer), "%.*f", digits, value);
+  return std::string(buffer);
+}
+
+void add_kv(diagnostic_msgs::msg::DiagnosticStatus& status, const std::string& key, const std::string& value)
+{
+  diagnostic_msgs::msg::KeyValue kv;
+  kv.key = key;
+  kv.value = value;
+  status.values.push_back(kv);
+}
+
+/// \brief mkdir -p, so a raw dump directory can be given as a nested path.
+bool make_directories(const std::string& path)
+{
+  if (path.empty())
+  {
+    return false;
+  }
+
+  for (size_t i = 1; i <= path.size(); i++)
+  {
+    if (i != path.size() && path[i] != '/')
+    {
+      continue;
+    }
+
+    std::string part = path.substr(0, i);
+
+    if (mkdir(part.c_str(), 0775) != 0 && errno != EEXIST)
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+}  // namespace
+
 UM982Gnss::UM982Gnss(const rclcpp::NodeOptions& options) : rclcpp_lifecycle::LifecycleNode("um982_gnss", options)
 {
   this->declare_parameter("device", device_);
@@ -18,6 +110,13 @@ UM982Gnss::UM982Gnss(const rclcpp::NodeOptions& options) : rclcpp_lifecycle::Lif
   this->declare_parameter("heading.tolerance", heading_tolerance_);
   this->declare_parameter("heading.offset", heading_offset_);
   this->declare_parameter("heading.pitch_offset", heading_pitch_offset_);
+  this->declare_parameter("extra_logs", extra_logs_);
+  this->declare_parameter("diagnostics.enable", diagnostics_enable_);
+  this->declare_parameter("diagnostics.rate", diagnostics_rate_);
+  this->declare_parameter("diagnostics.heading_std_warn", heading_std_warn_);
+  this->declare_parameter("raw_dump.enable", raw_dump_enable_);
+  this->declare_parameter("raw_dump.directory", raw_dump_dir_);
+  this->declare_parameter("raw_dump.max_mb", raw_dump_max_mb_);
 }
 
 LNI::CallbackReturn UM982Gnss::on_configure(const rclcpp_lifecycle::State&)
@@ -30,12 +129,20 @@ LNI::CallbackReturn UM982Gnss::on_configure(const rclcpp_lifecycle::State&)
   this->get_parameter("heading.tolerance", heading_tolerance_);
   this->get_parameter("heading.offset", heading_offset_);
   this->get_parameter("heading.pitch_offset", heading_pitch_offset_);
+  this->get_parameter("extra_logs", extra_logs_);
+  this->get_parameter("diagnostics.enable", diagnostics_enable_);
+  this->get_parameter("diagnostics.rate", diagnostics_rate_);
+  this->get_parameter("diagnostics.heading_std_warn", heading_std_warn_);
+  this->get_parameter("raw_dump.enable", raw_dump_enable_);
+  this->get_parameter("raw_dump.directory", raw_dump_dir_);
+  this->get_parameter("raw_dump.max_mb", raw_dump_max_mb_);
 
   navsatfix_main_pub_ = this->create_publisher<sensor_msgs::msg::NavSatFix>("navsatfix/main", 10);
   navsatfix_aux_pub_ = this->create_publisher<sensor_msgs::msg::NavSatFix>("navsatfix/aux", 10);
   gpsfix_main_pub_ = this->create_publisher<gps_msgs::msg::GPSFix>("gpsfix/main", 10);
   gpsfix_aux_pub_ = this->create_publisher<gps_msgs::msg::GPSFix>("gpsfix/aux", 10);
   gga_pub_ = this->create_publisher<nmea_msgs::msg::Sentence>("nmea", 10);
+  heading_diag_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("heading_diagnostics", 10);
 
   return LNI::CallbackReturn::SUCCESS;
 }
@@ -58,6 +165,21 @@ LNI::CallbackReturn UM982Gnss::on_activate(const rclcpp_lifecycle::State& state)
 
   initialized_ = false;
   stop_thread_ = false;
+
+  aux_fix_seen_ = false;
+  aux_fix_lost_ = false;
+  aux_fix_loss_count_ = 0;
+  aux_fix_lost_s_ = 0.0;
+  heading_fix_seen_ = false;
+  heading_fix_lost_ = false;
+  heading_loss_count_ = 0;
+  heading_lost_s_ = 0.0;
+  heading_length_seen_ = false;
+  uniheading_last_ = std::chrono::steady_clock::time_point{};
+  diagnostics_last_ = std::chrono::steady_clock::time_point{};
+
+  open_raw_dump();
+
   init_thread_ = std::thread(&UM982Gnss::init_thread_callback, this);
 
   timer_ = this->create_wall_timer(2min, std::bind(&UM982Gnss::timer_callback, this));
@@ -88,6 +210,7 @@ LNI::CallbackReturn UM982Gnss::on_cleanup(const rclcpp_lifecycle::State&)
   gpsfix_main_pub_.reset();
   gpsfix_aux_pub_.reset();
   gga_pub_.reset();
+  heading_diag_pub_.reset();
   rtcm_sub_.reset();
   bond_.reset();
 
@@ -104,6 +227,7 @@ LNI::CallbackReturn UM982Gnss::on_shutdown(const rclcpp_lifecycle::State&)
   gpsfix_main_pub_.reset();
   gpsfix_aux_pub_.reset();
   gga_pub_.reset();
+  heading_diag_pub_.reset();
   rtcm_sub_.reset();
   bond_.reset();
 
@@ -120,6 +244,9 @@ void UM982Gnss::close_serial()
   }
 
   ser_.close();
+
+  // Safe here only: the serial thread is joined, so dump_raw() can no longer run.
+  close_raw_dump();
 }
 
 void UM982Gnss::timer_callback()
@@ -237,6 +364,21 @@ void UM982Gnss::init_thread_callback()
       RCLCPP_ERROR(this->get_logger(), "Configuration failed");
       sleep = 0;
       continue;
+    }
+
+    // Investigation logs, requested after navigation is already configured and never
+    // gating on success: an unknown or unsupported log name must not keep the receiver
+    // from being usable.
+    for (const std::string& extra : extra_logs_)
+    {
+      if (command(extra))
+      {
+        RCLCPP_INFO_STREAM(this->get_logger(), "Extra log enabled: " << extra);
+      }
+      else
+      {
+        RCLCPP_WARN_STREAM(this->get_logger(), "Extra log refused by the receiver: " << extra);
+      }
     }
 
     RCLCPP_INFO(this->get_logger(), "Device configured");
@@ -501,7 +643,9 @@ void UM982Gnss::process_binary()
     handle_navsatfix(navsatfix_msg, bestnav_aux_);
     handle_gpsfix(gpsfix_msg, bestnav_aux_, stadop_aux_);
 
-    if (navsatfix_msg.status.status == sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX)
+    const bool aux_has_fix = navsatfix_msg.status.status == sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
+
+    if (aux_has_fix)
     {
       rtk_fix_ |= (1 << 1);
     }
@@ -512,6 +656,11 @@ void UM982Gnss::process_binary()
 
     navsatfix_aux_pub_->publish(navsatfix_msg);
     gpsfix_aux_pub_->publish(gpsfix_msg);
+
+    // BESTNAVH is the fastest message that always arrives (20 Hz), even while the heading
+    // solution is lost, so instrumentation is driven from here.
+    update_aux_fix_stats(aux_has_fix);
+    publish_heading_diagnostics();
   }
   else if (binary_.msg_id == 954)
   {
@@ -524,6 +673,247 @@ void UM982Gnss::process_binary()
   else if (binary_.msg_id == 972)
   {
     parse_uniheading(binary_, uniheading_);
+    update_heading_stats();
+  }
+}
+
+void UM982Gnss::update_aux_fix_stats(bool aux_has_fix)
+{
+  const auto now = std::chrono::steady_clock::now();
+
+  if (aux_has_fix)
+  {
+    if (aux_fix_lost_)
+    {
+      aux_fix_lost_ = false;
+      aux_fix_lost_s_ += std::chrono::duration<double>(now - aux_fix_lost_since_).count();
+    }
+
+    aux_fix_seen_ = true;
+    return;
+  }
+
+  // Only count losses after a first fix: the acquisition phase at startup is not a loss.
+  if (aux_fix_seen_ && !aux_fix_lost_)
+  {
+    aux_fix_lost_ = true;
+    aux_fix_lost_since_ = now;
+    aux_fix_loss_count_++;
+    RCLCPP_WARN(this->get_logger(),
+                "Auxiliary antenna lost RTK fix (%s), heading solution %s; loss #%u. This stops "
+                "odometry downstream while the main antenna is still fixed.",
+                pos_type_label(bestnav_aux_.pos_type), pos_type_label(uniheading_.pos_type),
+                static_cast<unsigned>(aux_fix_loss_count_));
+  }
+}
+
+void UM982Gnss::update_heading_stats()
+{
+  const auto now = std::chrono::steady_clock::now();
+  uniheading_last_ = now;
+
+  const bool heading_fixed = is_rtk_fixed(uniheading_.pos_type);
+
+  if (heading_fixed)
+  {
+    if (heading_fix_lost_)
+    {
+      heading_fix_lost_ = false;
+      heading_lost_s_ += std::chrono::duration<double>(now - heading_lost_since_).count();
+    }
+
+    heading_fix_seen_ = true;
+
+    // Baseline length is only meaningful on a fixed solution.
+    if (!heading_length_seen_)
+    {
+      heading_length_seen_ = true;
+      heading_length_min_ = uniheading_.length;
+      heading_length_max_ = uniheading_.length;
+    }
+    else
+    {
+      heading_length_min_ = std::min(heading_length_min_, uniheading_.length);
+      heading_length_max_ = std::max(heading_length_max_, uniheading_.length);
+    }
+
+    return;
+  }
+
+  if (heading_fix_seen_ && !heading_fix_lost_)
+  {
+    heading_fix_lost_ = true;
+    heading_lost_since_ = now;
+    heading_loss_count_++;
+  }
+}
+
+void UM982Gnss::publish_heading_diagnostics()
+{
+  if (!diagnostics_enable_ || !heading_diag_pub_ || diagnostics_rate_ <= 0.0)
+  {
+    return;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  const auto period = std::chrono::duration<double>(1.0 / diagnostics_rate_);
+
+  if (diagnostics_last_.time_since_epoch().count() != 0 &&
+      std::chrono::duration<double>(now - diagnostics_last_) < period)
+  {
+    return;
+  }
+
+  diagnostics_last_ = now;
+
+  const bool heading_fixed = is_rtk_fixed(uniheading_.pos_type);
+  const double uniheading_age =
+      uniheading_last_.time_since_epoch().count() == 0
+          ? -1.0
+          : std::chrono::duration<double>(now - uniheading_last_).count();
+
+  diagnostic_msgs::msg::DiagnosticStatus status;
+  status.name = "gnss dual antenna heading";
+  status.hardware_id = device_;
+
+  if (!heading_fixed)
+  {
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+    status.message = "heading baseline not fixed";
+  }
+  else if (uniheading_.hdg_std_dev > heading_std_warn_)
+  {
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::WARN;
+    status.message = "heading fixed but noisy";
+  }
+  else
+  {
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
+    status.message = "heading fixed";
+  }
+
+  // Heading solution (baseline main -> aux, constrained by CONFIG HEADING LENGTH).
+  add_kv(status, "heading.pos_type", pos_type_label(uniheading_.pos_type));
+  add_kv(status, "heading.sol_stat", std::to_string(uniheading_.sol_stat));
+  add_kv(status, "heading.deg", to_str(uniheading_.heading, 2));
+  add_kv(status, "heading.pitch_deg", to_str(uniheading_.pitch, 2));
+  add_kv(status, "heading.std_dev_deg", to_str(uniheading_.hdg_std_dev, 2));
+  add_kv(status, "heading.baseline_m", to_str(uniheading_.length, 3));
+  add_kv(status, "heading.age_s", to_str(uniheading_age, 2));
+
+  // The pair that separates a radio-frequency problem from a solver problem: satellites
+  // *tracked* by the antenna versus satellites *used* in the solution. Tracking high and
+  // usage low means the antenna receives fine and the ambiguity resolution is what fails.
+  add_kv(status, "heading.sat_tracked", std::to_string(uniheading_.sat_nb));
+  add_kv(status, "heading.sat_used", std::to_string(uniheading_.sol_sat_nb));
+  add_kv(status, "main.pos_type", pos_type_label(bestnav_main_.pos_type));
+  add_kv(status, "main.sat_tracked", std::to_string(bestnav_main_.sat_nb));
+  add_kv(status, "main.sat_used", std::to_string(bestnav_main_.sol_sat_nb));
+  add_kv(status, "main.diff_age_s", to_str(bestnav_main_.diff_age, 1));
+  add_kv(status, "aux.pos_type", pos_type_label(bestnav_aux_.pos_type));
+  add_kv(status, "aux.sat_tracked", std::to_string(bestnav_aux_.sat_nb));
+  add_kv(status, "aux.sat_used", std::to_string(bestnav_aux_.sol_sat_nb));
+  add_kv(status, "aux.diff_age_s", to_str(bestnav_aux_.diff_age, 1));
+
+  // Cumulative counters since activation, so a run can be judged without post-processing.
+  add_kv(status, "aux.fix_loss_count", std::to_string(aux_fix_loss_count_));
+  add_kv(status, "aux.fix_lost_s", to_str(aux_fix_lost_s_, 1));
+  add_kv(status, "heading.loss_count", std::to_string(heading_loss_count_));
+  add_kv(status, "heading.lost_s", to_str(heading_lost_s_, 1));
+  add_kv(status, "heading.baseline_min_m", to_str(heading_length_seen_ ? heading_length_min_ : 0.f, 3));
+  add_kv(status, "heading.baseline_max_m", to_str(heading_length_seen_ ? heading_length_max_ : 0.f, 3));
+  add_kv(status, "config.baseline_cm", std::to_string(heading_length_));
+  add_kv(status, "config.baseline_tolerance_cm", std::to_string(heading_tolerance_));
+
+  diagnostic_msgs::msg::DiagnosticArray array;
+  array.header.stamp = this->now();
+  array.header.frame_id = frame_main_;
+  array.status.push_back(status);
+
+  heading_diag_pub_->publish(array);
+}
+
+void UM982Gnss::open_raw_dump()
+{
+  if (!raw_dump_enable_ || raw_dump_file_ != nullptr)
+  {
+    return;
+  }
+
+  if (raw_dump_dir_.empty())
+  {
+    RCLCPP_WARN(this->get_logger(), "raw_dump.enable is set but raw_dump.directory is empty; dump disabled");
+    return;
+  }
+
+  if (!make_directories(raw_dump_dir_))
+  {
+    RCLCPP_ERROR_STREAM(this->get_logger(), "Cannot create raw dump directory: " << raw_dump_dir_);
+    return;
+  }
+
+  std::time_t t = std::time(nullptr);
+  char stamp[32] = { 0 };
+  std::strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", std::localtime(&t));
+
+  const std::string path = raw_dump_dir_ + "/um982_raw_" + stamp + ".bin";
+  raw_dump_file_ = fopen(path.c_str(), "wb");
+
+  if (raw_dump_file_ == nullptr)
+  {
+    RCLCPP_ERROR_STREAM(this->get_logger(), "Cannot open raw dump file: " << path);
+    return;
+  }
+
+  raw_dump_bytes_ = 0;
+  raw_dump_flushed_ = 0;
+  raw_dump_full_ = false;
+  RCLCPP_INFO_STREAM(this->get_logger(), "Raw receiver stream dumped to " << path);
+}
+
+void UM982Gnss::close_raw_dump()
+{
+  if (raw_dump_file_ == nullptr)
+  {
+    return;
+  }
+
+  fclose(raw_dump_file_);
+  raw_dump_file_ = nullptr;
+  RCLCPP_INFO(this->get_logger(), "Raw dump closed (%zu bytes)", raw_dump_bytes_);
+}
+
+void UM982Gnss::dump_raw(const std::vector<uint8_t>& data)
+{
+  if (raw_dump_file_ == nullptr || raw_dump_full_)
+  {
+    return;
+  }
+
+  const size_t written = fwrite(data.data(), 1, data.size(), raw_dump_file_);
+
+  if (written != data.size())
+  {
+    RCLCPP_ERROR(this->get_logger(), "Raw dump write failed, stopping the dump");
+    raw_dump_full_ = true;
+    return;
+  }
+
+  raw_dump_bytes_ += written;
+
+  // Flush every 64 kB so a power loss keeps most of the capture without paying a syscall
+  // on every serial chunk.
+  if (raw_dump_bytes_ - raw_dump_flushed_ >= 65536u)
+  {
+    fflush(raw_dump_file_);
+    raw_dump_flushed_ = raw_dump_bytes_;
+  }
+
+  if (raw_dump_max_mb_ > 0 && raw_dump_bytes_ >= static_cast<size_t>(raw_dump_max_mb_) * 1024u * 1024u)
+  {
+    raw_dump_full_ = true;
+    fflush(raw_dump_file_);
+    RCLCPP_WARN(this->get_logger(), "Raw dump size limit reached (%d MB), stopping the dump", raw_dump_max_mb_);
   }
 
   if (rtk_fix_ == 3)
@@ -559,6 +949,8 @@ bool UM982Gnss::command(const std::string& cmd)
 
 void UM982Gnss::callback(const std::vector<uint8_t>& data)
 {
+  dump_raw(data);
+
   for (uint8_t d : data)
   {
     parse_ascii(d);

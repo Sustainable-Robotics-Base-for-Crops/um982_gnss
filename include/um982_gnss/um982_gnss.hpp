@@ -3,6 +3,11 @@
 #ifndef UM982_GNSS__UM982_GNSS_HPP_
 #define UM982_GNSS__UM982_GNSS_HPP_
 
+#include <chrono>
+#include <cstdio>
+#include <string>
+#include <vector>
+
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
 #include "um982_gnss/bestnav.hpp"
@@ -14,6 +19,7 @@
 #include "nmea_msgs/msg/sentence.hpp"
 #include "gps_msgs/msg/gps_fix.hpp"
 #include "mavros_msgs/msg/rtcm.hpp"
+#include "diagnostic_msgs/msg/diagnostic_array.hpp"
 #include "bondcpp/bond.hpp"
 
 using LNI = rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface;
@@ -64,6 +70,15 @@ protected:
   void handle_navsatfix(sensor_msgs::msg::NavSatFix& msg, const sBestnav& bestnav);
   void handle_gpsfix(gps_msgs::msg::GPSFix& msg, const sBestnav& bestnav, const sStadop& stadop);
 
+  // Instrumentation. Everything below runs on the serial thread only (process_binary),
+  // so the counters need no locking.
+  void update_heading_stats();
+  void update_aux_fix_stats(bool aux_has_fix);
+  void publish_heading_diagnostics();
+  void open_raw_dump();
+  void close_raw_dump();
+  void dump_raw(const std::vector<uint8_t>& data);
+
 private:
   std::string device_{ "/dev/ttyUSB0" };
   int baudrate_{ 115200 };
@@ -73,6 +88,17 @@ private:
   int heading_tolerance_{ 3 };
   int heading_offset_{ 0 };
   int heading_pitch_offset_{ 0 };
+
+  // Extra Unicore logs requested after the mandatory ones, e.g. { "OBSVMB 1", "OBSVHB 1" }
+  // to investigate per-antenna satellite tracking. A rejected log is only a warning:
+  // navigation must never depend on an investigation log.
+  std::vector<std::string> extra_logs_;
+  bool diagnostics_enable_{ true };
+  double diagnostics_rate_{ 10.0 };
+  double heading_std_warn_{ 2.0 };
+  bool raw_dump_enable_{ false };
+  std::string raw_dump_dir_;
+  int raw_dump_max_mb_{ 256 };
 
   Serial ser_;
   sASCII ascii_;
@@ -93,11 +119,41 @@ private:
 
   rclcpp::TimerBase::SharedPtr timer_;
 
+  // Heading / auxiliary antenna instrumentation state (serial thread only).
+  // Rationale: on this platform the *auxiliary* solution is what drops, never the main
+  // one, and every drop stops /loc/odom downstream. These counters make the phenomenon
+  // measurable in a bag without post-processing.
+  bool aux_fix_seen_{ false };
+  bool aux_fix_lost_{ false };
+  uint32_t aux_fix_loss_count_{ 0 };
+  double aux_fix_lost_s_{ 0.0 };
+  std::chrono::steady_clock::time_point aux_fix_lost_since_{};
+
+  bool heading_fix_seen_{ false };
+  bool heading_fix_lost_{ false };
+  uint32_t heading_loss_count_{ 0 };
+  double heading_lost_s_{ 0.0 };
+  std::chrono::steady_clock::time_point heading_lost_since_{};
+
+  // Receiver-measured baseline length: tells a mechanical/flex problem (the length moves)
+  // apart from an ambiguity-resolution problem (the length stays, the fix drops).
+  bool heading_length_seen_{ false };
+  float heading_length_min_{ 0.f };
+  float heading_length_max_{ 0.f };
+  std::chrono::steady_clock::time_point uniheading_last_{};
+  std::chrono::steady_clock::time_point diagnostics_last_{};
+
+  FILE* raw_dump_file_{ nullptr };
+  size_t raw_dump_bytes_{ 0 };
+  size_t raw_dump_flushed_{ 0 };
+  bool raw_dump_full_{ false };
+
   rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::NavSatFix>::SharedPtr navsatfix_main_pub_;
   rclcpp_lifecycle::LifecyclePublisher<sensor_msgs::msg::NavSatFix>::SharedPtr navsatfix_aux_pub_;
   rclcpp_lifecycle::LifecyclePublisher<gps_msgs::msg::GPSFix>::SharedPtr gpsfix_main_pub_;
   rclcpp_lifecycle::LifecyclePublisher<gps_msgs::msg::GPSFix>::SharedPtr gpsfix_aux_pub_;
   rclcpp_lifecycle::LifecyclePublisher<nmea_msgs::msg::Sentence>::SharedPtr gga_pub_;
+  rclcpp_lifecycle::LifecyclePublisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr heading_diag_pub_;
   rclcpp::Subscription<mavros_msgs::msg::RTCM>::SharedPtr rtcm_sub_;
 };
 }  // namespace um982_gnss

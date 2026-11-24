@@ -9,3 +9,15 @@
       tolerance: 2    # cm
       offset: 0       # deg
       pitch_offset: 0 # deg
+    # Investigation logs sent after the mandatory configuration. A refused log is only a
+    # warning. Example for per-antenna satellite observations (needs raw_dump to be read):
+    # extra_logs: ["OBSVMB 1", "OBSVHB 1"]
+    extra_logs: []
+    diagnostics:
+      enable: true
+      rate: 10.0              # Hz, capped by the 20 Hz BESTNAVH rate
+      heading_std_warn: 2.0   # deg, above this the heading is reported as noisy
+    raw_dump:
+      enable: false           # dumps the whole receiver stream for offline decoding
+      directory: ""
+      max_mb: 256

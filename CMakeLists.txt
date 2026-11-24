@@ -18,6 +18,7 @@ set(dependencies
   mavros_msgs
   nmea_msgs
   gps_msgs
+  diagnostic_msgs
 )
 
 find_package(ament_cmake REQUIRED)
