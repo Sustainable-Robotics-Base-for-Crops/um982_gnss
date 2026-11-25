@@ -56,6 +56,12 @@ NtripClient::NtripClient(const rclcpp::NodeOptions& options) : rclcpp_lifecycle:
   this->declare_parameter("reconnect_attempt_max", reconnect_attempt_max_);
   this->declare_parameter("reconnect_attempt_wait_seconds", reconnect_attempt_wait_seconds_);
   this->declare_parameter("reconnect_attempt_reset_seconds", reconnect_attempt_reset_seconds_);
+
+  // Validation avant application ROS ; reconnexion après mise à jour effective.
+  on_set_parameters_handle_ = this->add_on_set_parameters_callback(
+      std::bind(&NtripClient::on_set_parameters_callback, this, std::placeholders::_1));
+  post_set_parameters_handle_ = this->add_post_set_parameters_callback(
+      std::bind(&NtripClient::on_post_set_parameters_callback, this, std::placeholders::_1));
 }
 
 namespace
@@ -71,27 +77,193 @@ std::string trim_config_string(const std::string& value)
   const auto end = value.find_last_not_of(" \t\n\r\f\v");
   return value.substr(begin, end - begin + 1);
 }
+
+/// Valide host/port/mountpoint et les identifiants si l'authentification est active.
+bool validate_connection_parameters(
+    const std::string& host, int port, bool authenticate, const std::string& mountpoint,
+    const std::string& username, const std::string& password, std::string* reason)
+{
+  if (host.empty())
+  {
+    if (reason != nullptr)
+    {
+      *reason = "host must not be empty";
+    }
+    return false;
+  }
+  if (port < 1 || port > 65535)
+  {
+    if (reason != nullptr)
+    {
+      *reason = "port must be in range 1-65535";
+    }
+    return false;
+  }
+  if (mountpoint.empty())
+  {
+    if (reason != nullptr)
+    {
+      *reason = "mountpoint must not be empty";
+    }
+    return false;
+  }
+  if (authenticate && (username.empty() || password.empty()))
+  {
+    if (reason != nullptr)
+    {
+      *reason = "username and password required when authenticate is true";
+    }
+    return false;
+  }
+  return true;
+}
+
+bool is_connection_parameter(const std::string& name)
+{
+  return name == "host" || name == "port" || name == "authenticate" || name == "mountpoint" ||
+         name == "username" || name == "password";
+}
 }  // namespace
+
+void NtripClient::sync_connection_parameters_from_ros()
+{
+  std::string host;
+  std::string mountpoint;
+  std::string username;
+  std::string password;
+  int port{ 0 };
+  bool authenticate{ false };
+
+  this->get_parameter("host", host);
+  this->get_parameter("port", port);
+  this->get_parameter("authenticate", authenticate);
+  this->get_parameter("mountpoint", mountpoint);
+  this->get_parameter("username", username);
+  this->get_parameter("password", password);
+
+  host = trim_config_string(host);
+  mountpoint = trim_config_string(mountpoint);
+  username = trim_config_string(username);
+  password = trim_config_string(password);
+
+  std::lock_guard<std::mutex> lock(config_mutex_);
+  host_ = host;
+  port_ = port;
+  authenticate_ = authenticate;
+  mountpoint_ = mountpoint;
+  username_ = username;
+  password_ = password;
+}
+
+NtripClient::ConnectionSnapshot NtripClient::get_connection_snapshot() const
+{
+  ConnectionSnapshot snap;
+  std::lock_guard<std::mutex> lock(config_mutex_);
+  snap.host = host_;
+  snap.port = port_;
+  snap.authenticate = authenticate_;
+  snap.mountpoint = mountpoint_;
+  snap.username = username_;
+  snap.password = password_;
+  return snap;
+}
+
+rcl_interfaces::msg::SetParametersResult NtripClient::on_set_parameters_callback(
+    const std::vector<rclcpp::Parameter>& parameters)
+{
+  rcl_interfaces::msg::SetParametersResult result;
+  result.successful = true;
+
+  bool touches_connection = false;
+  for (const auto& param : parameters)
+  {
+    if (is_connection_parameter(param.get_name()))
+    {
+      touches_connection = true;
+      break;
+    }
+  }
+
+  if (!touches_connection)
+  {
+    return result;
+  }
+
+  ConnectionSnapshot proposed = get_connection_snapshot();
+
+  for (const auto& param : parameters)
+  {
+    const std::string& name = param.get_name();
+    if (name == "host")
+    {
+      proposed.host = trim_config_string(param.as_string());
+    }
+    else if (name == "port")
+    {
+      proposed.port = param.as_int();
+    }
+    else if (name == "authenticate")
+    {
+      proposed.authenticate = param.as_bool();
+    }
+    else if (name == "mountpoint")
+    {
+      proposed.mountpoint = trim_config_string(param.as_string());
+    }
+    else if (name == "username")
+    {
+      proposed.username = trim_config_string(param.as_string());
+    }
+    else if (name == "password")
+    {
+      proposed.password = trim_config_string(param.as_string());
+    }
+  }
+
+  std::string reason;
+  if (!validate_connection_parameters(proposed.host, proposed.port, proposed.authenticate, proposed.mountpoint,
+                                      proposed.username, proposed.password, &reason))
+  {
+    result.successful = false;
+    result.reason = reason;
+    RCLCPP_WARN(this->get_logger(), "Rejected NTRIP parameter update: %s", reason.c_str());
+  }
+
+  return result;
+}
+
+void NtripClient::on_post_set_parameters_callback(const std::vector<rclcpp::Parameter>& parameters)
+{
+  bool touches_connection = false;
+  for (const auto& param : parameters)
+  {
+    if (is_connection_parameter(param.get_name()))
+    {
+      touches_connection = true;
+      break;
+    }
+  }
+
+  if (!touches_connection)
+  {
+    return;
+  }
+
+  sync_connection_parameters_from_ros();
+  config_reload_requested_ = true;
+  initialized_ = false;
+  RCLCPP_INFO(this->get_logger(), "NTRIP connection parameters updated; scheduling reconnect");
+}
 
 LNI::CallbackReturn NtripClient::on_configure(const rclcpp_lifecycle::State&)
 {
-  this->get_parameter("host", host_);
-  this->get_parameter("port", port_);
-  this->get_parameter("authenticate", authenticate_);
-  this->get_parameter("mountpoint", mountpoint_);
-  this->get_parameter("username", username_);
-  this->get_parameter("password", password_);
   this->get_parameter("frame_id", frame_id_);
   this->get_parameter("rtcm_timeout_seconds", rtcm_timeout_seconds_);
   this->get_parameter("reconnect_attempt_max", reconnect_attempt_max_);
   this->get_parameter("reconnect_attempt_wait_seconds", reconnect_attempt_wait_seconds_);
   this->get_parameter("reconnect_attempt_reset_seconds", reconnect_attempt_reset_seconds_);
 
-  // Normalise les champs texte avant connexion (YAML édité à la main, copier-coller).
-  host_ = trim_config_string(host_);
-  mountpoint_ = trim_config_string(mountpoint_);
-  username_ = trim_config_string(username_);
-  password_ = trim_config_string(password_);
+  sync_connection_parameters_from_ros();
 
   rtcm_msg_.header.frame_id = frame_id_;
   rtcm_pub_ = this->create_publisher<mavros_msgs::msg::RTCM>("rtcm", 10);
@@ -216,6 +388,17 @@ void NtripClient::init_thread_callback()
   {
     std::this_thread::sleep_for(100ms);
 
+    if (config_reload_requested_.exchange(false))
+    {
+      tcp_.close();
+      reconnect_attempt_ = 0;
+      reconnect_attempt_wait_ = false;
+      state_ = PREAMBLE;
+      crc_.clear();
+      rtcm_msg_.data.clear();
+      RCLCPP_INFO(this->get_logger(), "Applying new NTRIP configuration and closing current connection");
+    }
+
     if (initialized_ || reconnect_attempt_wait_ || reconnect_attempt_ > reconnect_attempt_max_)
     {
       continue;
@@ -223,9 +406,12 @@ void NtripClient::init_thread_callback()
 
     attempt_reset_timer_->reset();
 
-    if (!tcp_.open(port_, host_, &NtripClient::callback, this))
+    const ConnectionSnapshot conn = get_connection_snapshot();
+
+    if (!tcp_.open(conn.port, conn.host, &NtripClient::callback, this))
     {
-      RCLCPP_ERROR_STREAM(this->get_logger(), "Unable to connect socket to server at http://" << host_ << ":" << port_);
+      RCLCPP_ERROR_STREAM(this->get_logger(),
+                          "Unable to connect socket to server at http://" << conn.host << ":" << conn.port);
       attempt_wait_timer_->reset();
       reconnect_attempt_wait_ = true;
       continue;
@@ -233,27 +419,29 @@ void NtripClient::init_thread_callback()
 
     std::string request;
 
-    if (authenticate_)
+    if (conn.authenticate)
     {
-      std::string auth = base64_encode(username_ + ":" + password_);
-      request = "GET /" + mountpoint_ + " HTTP/1.0\r\n" + "User-Agent: NTRIP ROS2Client\r\n" + "Authorization: Basic " +
-                auth + "\r\n" + "Connection: close\r\n\r\n";
+      std::string auth = base64_encode(conn.username + ":" + conn.password);
+      request = "GET /" + conn.mountpoint + " HTTP/1.0\r\n" + "User-Agent: NTRIP ROS2Client\r\n" +
+                "Authorization: Basic " + auth + "\r\n" + "Connection: close\r\n\r\n";
     }
     else
     {
-      request =
-          "GET /" + mountpoint_ + " HTTP/1.0\r\n" + "User-Agent: NTRIP ROS2Client\r\n" + "Connection: close\r\n\r\n";
+      request = "GET /" + conn.mountpoint + " HTTP/1.0\r\n" + "User-Agent: NTRIP ROS2Client\r\n" +
+                "Connection: close\r\n\r\n";
     }
 
     if (!tcp_.send(request))
     {
-      RCLCPP_ERROR_STREAM(this->get_logger(), "Unable to send request to server at http://" << host_ << ":" << port_);
+      RCLCPP_ERROR_STREAM(this->get_logger(),
+                          "Unable to send request to server at http://" << conn.host << ":" << conn.port);
       attempt_wait_timer_->reset();
       reconnect_attempt_wait_ = true;
       continue;
     }
 
-    RCLCPP_INFO_STREAM(this->get_logger(), "Connected to http://" << host_ << ":" << port_ << "/" << mountpoint_);
+    RCLCPP_INFO_STREAM(this->get_logger(),
+                       "Connected to http://" << conn.host << ":" << conn.port << "/" << conn.mountpoint);
 
     rtcm_timeout_timer_->reset();
     attempt_wait_timer_->reset();
