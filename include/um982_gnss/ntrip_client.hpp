@@ -3,8 +3,15 @@
 #ifndef UM982_GNSS__NTRIP_CLIENT_HPP_
 #define UM982_GNSS__NTRIP_CLIENT_HPP_
 
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_lifecycle/lifecycle_node.hpp"
+#include "rcl_interfaces/msg/set_parameters_result.hpp"
 #include "um982_gnss/tcp.hpp"
 #include "nmea_msgs/msg/sentence.hpp"
 #include "mavros_msgs/msg/rtcm.hpp"
@@ -57,6 +64,24 @@ protected:
   void gga_callback(const nmea_msgs::msg::Sentence::SharedPtr msg);
 
 private:
+  /// Paramètres TCP/NTRIP utilisés par le thread de connexion (copie sous mutex).
+  struct ConnectionSnapshot
+  {
+    std::string host;
+    int port{ 2101 };
+    bool authenticate{ false };
+    std::string mountpoint;
+    std::string username;
+    std::string password;
+  };
+
+  void sync_connection_parameters_from_ros();
+  rcl_interfaces::msg::SetParametersResult on_set_parameters_callback(
+      const std::vector<rclcpp::Parameter>& parameters);
+  void on_post_set_parameters_callback(const std::vector<rclcpp::Parameter>& parameters);
+
+  ConnectionSnapshot get_connection_snapshot() const;
+
   enum eRTCM
   {
     PREAMBLE,
@@ -77,12 +102,15 @@ private:
   double reconnect_attempt_wait_seconds_{ 5.0 };
   double reconnect_attempt_reset_seconds_{ 300.0 };
 
+  mutable std::mutex config_mutex_;
+  std::atomic<bool> config_reload_requested_{ false };
+
   TCP tcp_;
   std::thread init_thread_;
-  std::atomic<bool> initialized_;
-  std::atomic<bool> stop_thread_;
-  std::atomic<bool> reconnect_attempt_wait_;
-  std::atomic<uint8_t> reconnect_attempt_;
+  std::atomic<bool> initialized_{ false };
+  std::atomic<bool> stop_thread_{ false };
+  std::atomic<bool> reconnect_attempt_wait_{ false };
+  std::atomic<uint8_t> reconnect_attempt_{ 0 };
   std::vector<uint8_t> crc_;
   std::unique_ptr<bond::Bond> bond_;
 
@@ -93,6 +121,9 @@ private:
   mavros_msgs::msg::RTCM rtcm_msg_;
   rclcpp_lifecycle::LifecyclePublisher<mavros_msgs::msg::RTCM>::SharedPtr rtcm_pub_;
   rclcpp::Subscription<nmea_msgs::msg::Sentence>::SharedPtr gga_sub_;
+
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr on_set_parameters_handle_;
+  rclcpp::node_interfaces::PostSetParametersCallbackHandle::SharedPtr post_set_parameters_handle_;
 };
 }  // namespace um982_gnss
 

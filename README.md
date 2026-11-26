@@ -54,6 +54,8 @@ On activate:
 2. Subscribe to `nmea` and send GGA sentences to the caster.
 3. Parse incoming RTCM3 and publish on `rtcm`.
 
+While the node is active, the connection parameters `host`, `port`, `authenticate`, `mountpoint`, `username`, and `password` can be updated at runtime (`ros2 param set`, `ros2 param load`, or the gRPC config server). Invalid values are rejected and the current TCP session is preserved. After a successful update, the node closes the NTRIP socket and reconnects with the new settings.
+
 ### Node parameters
 
 | Parameter      | Default (header) | Description                  |
